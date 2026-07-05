@@ -320,7 +320,7 @@ func (c *CreditsBalance) UnmarshalJSON(data []byte) error {
 // Models fetches the TrustedRouter model catalog.
 func (c *Client) Models(ctx context.Context, opts *ModelListOptions) (*ModelList, error) {
 	var out ModelList
-	if err := c.Request(ctx, http.MethodGet, modelsPath(opts), nil, &out, nil); err != nil {
+	if err := c.controlRequest(ctx, http.MethodGet, modelsPath(opts), nil, &out, nil); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -329,7 +329,7 @@ func (c *Client) Models(ctx context.Context, opts *ModelListOptions) (*ModelList
 // Providers fetches the TrustedRouter provider catalog.
 func (c *Client) Providers(ctx context.Context) (*ProviderList, error) {
 	var out ProviderList
-	if err := c.Request(ctx, http.MethodGet, "/providers", nil, &out, nil); err != nil {
+	if err := c.controlRequest(ctx, http.MethodGet, "/providers", nil, &out, nil); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -338,7 +338,7 @@ func (c *Client) Providers(ctx context.Context) (*ProviderList, error) {
 // Regions fetches the TrustedRouter region catalog.
 func (c *Client) Regions(ctx context.Context) (*RegionList, error) {
 	var out RegionList
-	if err := c.Request(ctx, http.MethodGet, "/regions", nil, &out, nil); err != nil {
+	if err := c.controlRequest(ctx, http.MethodGet, "/regions", nil, &out, nil); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -355,7 +355,7 @@ func (c *Client) Credits(ctx context.Context, opts *CreditsOptions) (*CreditsBal
 		}
 		callOpts = &value
 	}
-	if err := c.Request(ctx, http.MethodGet, "/credits", nil, &out, callOpts); err != nil {
+	if err := c.controlRequest(ctx, http.MethodGet, "/credits", nil, &out, callOpts); err != nil {
 		return nil, err
 	}
 	return &out, nil

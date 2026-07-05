@@ -734,7 +734,6 @@ func (c *Client) openEventStream(ctx context.Context, method, path string, body 
 	callOpts.ExtraHeaders = headers
 
 	attempt := 0
-	baseIndex := 0
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -746,7 +745,7 @@ func (c *Client) openEventStream(ctx context.Context, method, path string, body 
 				cancelAttempt(errOpenTimeout)
 			})
 		}
-		url := joinURL(c.baseURLs[baseIndex], path)
+		url := joinURL(c.baseURL, path)
 		httpReq, err := c.newHTTPRequest(attemptCtx, method, url, bodyBytes, true, &callOpts)
 		if err != nil {
 			stopTimer(openTimer)
@@ -763,12 +762,9 @@ func (c *Client) openEventStream(ctx context.Context, method, path string, body 
 			if errors.Is(context.Cause(attemptCtx), errOpenTimeout) {
 				err = errOpenTimeout
 			}
-			if attempt >= c.maxRetries {
+			if attempt >= c.maxRetries || !c.regionalFailover {
 				cancelAttempt(nil)
 				return nil, transportRetryError(err)
-			}
-			if baseIndex < len(c.baseURLs)-1 {
-				baseIndex++
 			}
 			cancelAttempt(nil)
 			if sleepErr := sleepForRetry(ctx, attempt, nil); sleepErr != nil {
@@ -778,11 +774,10 @@ func (c *Client) openEventStream(ctx context.Context, method, path string, body 
 			continue
 		}
 		if resp.StatusCode >= 400 {
-			if attempt < c.maxRetries && regionalFailoverable(resp.StatusCode) && baseIndex < len(c.baseURLs)-1 {
+			if attempt < c.maxRetries && c.regionalFailover && regionalFailoverable(resp.StatusCode) {
 				retryAfter := retryAfterSeconds(resp.Header)
 				drainAndClose(resp.Body)
 				cancelAttempt(nil)
-				baseIndex++
 				if sleepErr := sleepForRetry(ctx, attempt, retryAfter); sleepErr != nil {
 					return nil, sleepErr
 				}

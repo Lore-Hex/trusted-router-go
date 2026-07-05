@@ -22,10 +22,10 @@ const defaultMaxRetries = 2
 type Options struct {
 	// APIKey is the bearer token used for requests.
 	APIKey string
-	// BaseURL is a custom OpenAI-compatible API base URL.
+	// BaseURL is a custom OpenAI-compatible inference API base URL.
 	BaseURL string
-	// Region pins the client to a known TrustedRouter region.
-	Region string
+	// ControlBaseURL is a custom TrustedRouter control-plane base URL.
+	ControlBaseURL string
 	// HTTPClient is the HTTP client used for network requests.
 	// When HTTPClient is provided, it is used verbatim; SDK timeouts are still
 	// applied with request contexts and any timeout on the supplied client remains
@@ -43,10 +43,10 @@ type Options struct {
 	WorkspaceID string
 	// MaxRetries controls automatic retries; nil uses the reference default.
 	MaxRetries *int
-	// RegionalFailover enables or disables regional failover; nil mirrors the reference default.
+	// RegionalFailover enables or disables regional failover; nil defaults to on.
+	// The apex is a global load balancer; failover is handled server-side, so the
+	// SDK re-requests the apex rather than pinning per-region hosts.
 	RegionalFailover *bool
-	// FailoverRegions is the ordered regional failover list.
-	FailoverRegions []string
 }
 
 // CallOptions configures a single TrustedRouter API call.
@@ -69,36 +69,31 @@ type CallOptions struct {
 
 // Client is a TrustedRouter API client.
 type Client struct {
-	apiKey      string
-	baseURL     string
-	region      string
-	httpClient  *http.Client
-	timeout     *time.Duration
-	headers     map[string]string
-	workspaceID string
-	maxRetries  int
-	baseURLs    []string
+	apiKey           string
+	baseURL          string
+	controlBaseURL   string
+	httpClient       *http.Client
+	timeout          *time.Duration
+	headers          map[string]string
+	workspaceID      string
+	maxRetries       int
+	regionalFailover bool
+	baseURLs         []string
 }
 
 // NewClient constructs a TrustedRouter client.
 func NewClient(opts Options) (*Client, error) {
-	explicitEndpoint := opts.Region != "" || opts.BaseURL != ""
-	if opts.Region != "" && opts.BaseURL != "" {
-		return nil, &Error{Message: "pass region= OR base_url=, not both"}
-	}
-
 	baseURL := opts.BaseURL
-	if opts.Region != "" {
-		var err error
-		baseURL, err = RegionBaseURL(opts.Region)
-		if err != nil {
-			return nil, err
-		}
-	}
 	if baseURL == "" {
 		baseURL = DefaultAPIBaseURL
 	}
 	baseURL = strings.TrimRight(baseURL, "/")
+
+	controlBaseURL := opts.ControlBaseURL
+	if controlBaseURL == "" {
+		controlBaseURL = DefaultControlBaseURL
+	}
+	controlBaseURL = strings.TrimRight(controlBaseURL, "/")
 
 	maxRetries := defaultMaxRetries
 	if opts.MaxRetries != nil {
@@ -108,13 +103,9 @@ func NewClient(opts Options) (*Client, error) {
 		maxRetries = 0
 	}
 
-	failoverEnabled := !explicitEndpoint
+	failoverEnabled := true
 	if opts.RegionalFailover != nil {
 		failoverEnabled = *opts.RegionalFailover
-	}
-	baseURLs, err := regionalBaseURLs(baseURL, failoverEnabled, opts.FailoverRegions)
-	if err != nil {
-		return nil, err
 	}
 
 	httpClient := opts.HTTPClient
@@ -129,15 +120,16 @@ func NewClient(opts Options) (*Client, error) {
 	}
 
 	return &Client{
-		apiKey:      opts.APIKey,
-		baseURL:     baseURL,
-		region:      opts.Region,
-		httpClient:  httpClient,
-		timeout:     defaultTimeout,
-		headers:     headers,
-		workspaceID: opts.WorkspaceID,
-		maxRetries:  maxRetries,
-		baseURLs:    baseURLs,
+		apiKey:           opts.APIKey,
+		baseURL:          baseURL,
+		controlBaseURL:   controlBaseURL,
+		httpClient:       httpClient,
+		timeout:          defaultTimeout,
+		headers:          headers,
+		workspaceID:      opts.WorkspaceID,
+		maxRetries:       maxRetries,
+		regionalFailover: failoverEnabled,
+		baseURLs:         []string{baseURL},
 	}, nil
 }
 
@@ -170,12 +162,13 @@ func (c *Client) BaseURL() string {
 	return c.baseURL
 }
 
-// Region returns the configured region, if any.
-func (c *Client) Region() string {
-	return c.region
+// ControlBaseURL returns the normalized primary control-plane base URL.
+func (c *Client) ControlBaseURL() string {
+	return c.controlBaseURL
 }
 
-// BaseURLs returns the ordered primary and failover API base URLs.
+// BaseURLs returns the normalized inference API base URL.
+// Regional failover re-requests this apex/global-load-balancer URL.
 func (c *Client) BaseURLs() []string {
 	out := make([]string, len(c.baseURLs))
 	copy(out, c.baseURLs)
@@ -201,13 +194,30 @@ func (c *Client) RawRequest(ctx context.Context, method, path string, body any, 
 }
 
 func (c *Client) rawRequest(ctx context.Context, method, path string, body any, opts *CallOptions) (*http.Response, error) {
+	return c.rawRequestWithBaseURLs(ctx, method, path, body, opts, c.baseURLs, c.regionalFailover)
+}
+
+func (c *Client) controlRequest(ctx context.Context, method, path string, body any, out any, opts *CallOptions) error {
+	resp, err := c.rawControlRequest(ctx, method, path, body, opts)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	return decodeResponse(ctx, resp, out)
+}
+
+func (c *Client) rawControlRequest(ctx context.Context, method, path string, body any, opts *CallOptions) (*http.Response, error) {
+	return c.rawRequestWithBaseURLs(ctx, method, path, body, opts, []string{c.controlBaseURL}, true)
+}
+
+func (c *Client) rawRequestWithBaseURLs(ctx context.Context, method, path string, body any, opts *CallOptions, baseURLs []string, regionalFailover bool) (*http.Response, error) {
 	bodyBytes, hasBody, err := marshalRequestBody(body)
 	if err != nil {
 		return nil, err
 	}
 
 	attempt := 0
-	baseIndex := 0
+	baseURL := baseURLs[0]
 	timeout, hasTimeout := c.effectiveTimeout(opts)
 	for {
 		if err := ctx.Err(); err != nil {
@@ -216,7 +226,7 @@ func (c *Client) rawRequest(ctx context.Context, method, path string, body any, 
 
 		attemptCtx, cancel := contextWithOptionalTimeout(ctx, timeout, hasTimeout)
 
-		req, err := c.newHTTPRequest(attemptCtx, method, joinURL(c.baseURLs[baseIndex], path), bodyBytes, hasBody, opts)
+		req, err := c.newHTTPRequest(attemptCtx, method, joinURL(baseURL, path), bodyBytes, hasBody, opts)
 		if err != nil {
 			cancel()
 			return nil, err
@@ -228,12 +238,9 @@ func (c *Client) rawRequest(ctx context.Context, method, path string, body any, 
 				cancel()
 				return nil, ctxErr
 			}
-			if attempt >= c.maxRetries {
+			if attempt >= c.maxRetries || !regionalFailover {
 				cancel()
 				return nil, transportRetryError(err)
-			}
-			if baseIndex < len(c.baseURLs)-1 {
-				baseIndex++
 			}
 			cancel()
 			if sleepErr := sleepForRetry(ctx, attempt, nil); sleepErr != nil {
@@ -243,14 +250,11 @@ func (c *Client) rawRequest(ctx context.Context, method, path string, body any, 
 			continue
 		}
 
-		if attempt >= c.maxRetries || !retryable(resp.StatusCode) {
+		if attempt >= c.maxRetries || !retryable(resp.StatusCode, regionalFailover) {
 			if hasTimeout {
 				resp.Body = cancelOnCloseReadCloser{ReadCloser: resp.Body, cancel: cancel}
 			}
 			return resp, nil
-		}
-		if regionalFailoverable(resp.StatusCode) && baseIndex < len(c.baseURLs)-1 {
-			baseIndex++
 		}
 		retryAfter := retryAfterSeconds(resp.Header)
 		drainAndClose(resp.Body)
@@ -303,37 +307,6 @@ func (r cancelOnCloseReadCloser) Close() error {
 	err := r.ReadCloser.Close()
 	r.cancel()
 	return err
-}
-
-func regionalBaseURLs(primaryBaseURL string, enabled bool, failoverRegions []string) ([]string, error) {
-	urls := []string{strings.TrimRight(primaryBaseURL, "/")}
-	if !enabled {
-		return urls, nil
-	}
-	regions := failoverRegions
-	if len(regions) == 0 {
-		regions = DefaultFailoverRegions
-	}
-	for _, region := range regions {
-		candidate, err := RegionBaseURL(region)
-		if err != nil {
-			return nil, err
-		}
-		candidate = strings.TrimRight(candidate, "/")
-		if !stringInSlice(candidate, urls) {
-			urls = append(urls, candidate)
-		}
-	}
-	return urls, nil
-}
-
-func stringInSlice(needle string, haystack []string) bool {
-	for _, value := range haystack {
-		if value == needle {
-			return true
-		}
-	}
-	return false
 }
 
 func marshalRequestBody(body any) ([]byte, bool, error) {

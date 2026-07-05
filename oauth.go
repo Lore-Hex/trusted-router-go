@@ -144,7 +144,7 @@ func CreateOAuthPkcePair(codeVerifier ...string) OAuthPkcePair {
 
 // OAuthAuthorizeURL builds the browser authorize URL.
 func (c *Client) OAuthAuthorizeURL(opts OAuthAuthorizeURLOptions) (string, error) {
-	return oauthAuthorizeURL(c.baseURL, opts)
+	return oauthAuthorizeURL(c.controlBaseURL, opts)
 }
 
 // CreateOAuthAuthorization generates PKCE/state and builds the authorize URL.
@@ -191,7 +191,7 @@ func (c *Client) ExchangeOAuthKey(ctx context.Context, req OAuthKeyExchangeReque
 	emptyAPIKey := ""
 	callOpts := CallOptions{APIKey: &emptyAPIKey, Timeout: req.Timeout}
 	var out OAuthKeyExchangeResponse
-	if err := c.Request(ctx, http.MethodPost, "/auth/keys", body, &out, &callOpts); err != nil {
+	if err := c.controlRequest(ctx, http.MethodPost, "/auth/keys", body, &out, &callOpts); err != nil {
 		return nil, err
 	}
 	return &out, nil

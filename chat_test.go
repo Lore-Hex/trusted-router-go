@@ -229,7 +229,7 @@ func TestChatStreamMidReadErrorIsWrapped(t *testing.T) {
 	if !errors.As(gotErr, &internal) || internal.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("expected wrapped InternalError, got %T %[1]v", gotErr)
 	}
-	if !strings.Contains(internal.Message, "TrustedRouter regional endpoint unavailable: socket closed") {
+	if !strings.Contains(internal.Message, "TrustedRouter endpoint unavailable: socket closed") {
 		t.Fatalf("message = %q", internal.Message)
 	}
 }

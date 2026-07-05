@@ -186,6 +186,7 @@ func newCatalogWireClient(t *testing.T, opts Options, handler http.HandlerFunc) 
 	t.Helper()
 	maxRetries := 0
 	opts.BaseURL = "https://example.test"
+	opts.ControlBaseURL = "https://example.test"
 	opts.MaxRetries = &maxRetries
 	opts.HTTPClient = newRoundTripClient(func(r *http.Request) (*http.Response, error) {
 		recorder := httptest.NewRecorder()

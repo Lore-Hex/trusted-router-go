@@ -148,7 +148,7 @@ func classifyError(status int, message string, payload any, headers http.Header)
 func transportRetryError(err error) error {
 	return &InternalError{embeddedError: &Error{
 		StatusCode: http.StatusServiceUnavailable,
-		Message:    fmt.Sprintf("TrustedRouter regional endpoint unavailable: %s", err),
+		Message:    fmt.Sprintf("TrustedRouter endpoint unavailable: %s", err),
 	}}
 }
 
@@ -168,8 +168,14 @@ func retryAfterSeconds(headers http.Header) *float64 {
 	return &parsed
 }
 
-func retryable(status int) bool {
-	return status == http.StatusTooManyRequests || status >= 500
+func retryable(status int, regionalFailover bool) bool {
+	if status == http.StatusTooManyRequests {
+		return true
+	}
+	if regionalFailoverable(status) {
+		return regionalFailover
+	}
+	return status >= 500
 }
 
 func regionalFailoverable(status int) bool {

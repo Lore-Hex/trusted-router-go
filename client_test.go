@@ -24,23 +24,11 @@ func TestClientConstruction(t *testing.T) {
 	if client.BaseURL() != DefaultAPIBaseURL {
 		t.Fatalf("base url = %q", client.BaseURL())
 	}
-	if got := client.BaseURLs(); strings.Join(got, ",") != strings.Join([]string{
-		DefaultAPIBaseURL,
-		"https://api-us-east4.quillrouter.com/v1",
-		"https://api-europe-west4.quillrouter.com/v1",
-	}, ",") {
+	if client.ControlBaseURL() != DefaultControlBaseURL {
+		t.Fatalf("control base url = %q", client.ControlBaseURL())
+	}
+	if got := client.BaseURLs(); strings.Join(got, ",") != DefaultAPIBaseURL {
 		t.Fatalf("base urls = %#v", got)
-	}
-
-	regional, err := NewClient(Options{Region: "europe-west4"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if regional.BaseURL() != "https://api-europe-west4.quillrouter.com/v1" {
-		t.Fatalf("regional base url = %q", regional.BaseURL())
-	}
-	if len(regional.BaseURLs()) != 1 {
-		t.Fatalf("regional default failover = %#v", regional.BaseURLs())
 	}
 
 	explicit, err := NewClient(Options{BaseURL: "https://example.test/v1/"})
@@ -50,6 +38,9 @@ func TestClientConstruction(t *testing.T) {
 	if explicit.BaseURL() != "https://example.test/v1" {
 		t.Fatalf("explicit base url = %q", explicit.BaseURL())
 	}
+	if explicit.ControlBaseURL() != DefaultControlBaseURL {
+		t.Fatalf("explicit control base url = %q", explicit.ControlBaseURL())
+	}
 	if len(explicit.BaseURLs()) != 1 {
 		t.Fatalf("explicit default failover = %#v", explicit.BaseURLs())
 	}
@@ -58,30 +49,192 @@ func TestClientConstruction(t *testing.T) {
 	failover, err := NewClient(Options{
 		BaseURL:          "https://example.test/v1",
 		RegionalFailover: &enabled,
-		FailoverRegions:  []string{"europe-west4"},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := failover.BaseURLs(); strings.Join(got, ",") != "https://example.test/v1,https://api-europe-west4.quillrouter.com/v1" {
+	if got := failover.BaseURLs(); strings.Join(got, ",") != "https://example.test/v1" {
 		t.Fatalf("explicit failover urls = %#v", got)
-	}
-
-	if _, err := NewClient(Options{Region: "us-central1", BaseURL: "https://example.test/v1"}); err == nil {
-		t.Fatal("expected region/base_url collision error")
 	}
 }
 
-func TestRegionBaseURL(t *testing.T) {
-	got, err := RegionBaseURL("us-east4")
+func TestDefaultInferenceAndControlHostsByMethod(t *testing.T) {
+	type seenRequest struct {
+		method string
+		path   string
+		host   string
+	}
+	var seen []seenRequest
+	sdk, err := NewClient(Options{
+		HTTPClient: newRoundTripClient(func(r *http.Request) (*http.Response, error) {
+			seen = append(seen, seenRequest{
+				method: r.Method,
+				path:   r.URL.Path,
+				host:   requestHost(r),
+			})
+			switch r.URL.Path {
+			case "/v1/models":
+				return jsonResponse(http.StatusOK, map[string]any{"data": []any{}}, nil), nil
+			case "/v1/providers":
+				return jsonResponse(http.StatusOK, map[string]any{"data": []any{}}, nil), nil
+			case "/v1/credits":
+				return jsonResponse(http.StatusOK, map[string]any{"data": map[string]any{"balance": 0}}, nil), nil
+			case "/v1/auth/keys":
+				return jsonResponse(http.StatusOK, map[string]any{"key": "sk-tr-v1-delegated"}, nil), nil
+			case "/v1/broadcast/destinations":
+				return jsonResponse(http.StatusOK, map[string]any{"data": []any{}}, nil), nil
+			case "/v1/billing/checkout":
+				return jsonResponse(http.StatusOK, map[string]any{"url": "https://checkout.example/session"}, nil), nil
+			case "/v1/chat/completions":
+				return textResponse(http.StatusOK, `data: {"id":"chat_1","choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}`+"\n\n", http.Header{"Content-Type": []string{"text/event-stream"}}), nil
+			case "/v1/messages":
+				return jsonResponse(http.StatusOK, map[string]any{
+					"id":      "msg_1",
+					"role":    "assistant",
+					"content": []map[string]any{{"type": "text", "text": "ok"}},
+					"model":   "model/a",
+				}, nil), nil
+			case "/v1/responses":
+				return jsonResponse(http.StatusOK, map[string]any{"id": "resp_1", "object": "response"}, nil), nil
+			case "/v1/embeddings":
+				return jsonResponse(http.StatusOK, map[string]any{
+					"data":  []map[string]any{{"index": 0, "embedding": []float64{0.1}}},
+					"model": "embed/model",
+				}, nil), nil
+			default:
+				t.Fatalf("unexpected request = %s %s", r.Method, r.URL.String())
+				return nil, nil
+			}
+		}),
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != "https://api-us-east4.quillrouter.com/v1" {
-		t.Fatalf("url = %q", got)
+
+	if _, err := sdk.Models(context.Background(), nil); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := RegionBaseURL("mars-1"); err == nil || !strings.Contains(err.Error(), `unknown TrustedRouter region "mars-1"`) {
-		t.Fatalf("unknown region error = %v", err)
+	if _, err := sdk.Providers(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sdk.Credits(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sdk.ExchangeOAuthKey(context.Background(), OAuthKeyExchangeRequest{Code: "auth-code"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sdk.BroadcastDestinations(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sdk.BillingCheckout(context.Background(), BillingCheckoutRequest{Amount: 1}); err != nil {
+		t.Fatal(err)
+	}
+	for text, err := range sdk.ChatCompletionsText(context.Background(), ChatRequest{
+		Messages: []map[string]any{{"role": "user", "content": "hi"}},
+	}) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		if text != "ok" {
+			t.Fatalf("chat text = %q", text)
+		}
+	}
+	if _, err := sdk.Messages(context.Background(), MessagesRequest{
+		Model:    "model/a",
+		Messages: []map[string]any{{"role": "user", "content": "hi"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sdk.Responses(context.Background(), ResponsesRequest{Input: "hi"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sdk.Embeddings(context.Background(), EmbeddingsRequest{
+		Model: "embed/model",
+		Input: "hi",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	want := []seenRequest{
+		{method: http.MethodGet, path: "/v1/models", host: "trustedrouter.com"},
+		{method: http.MethodGet, path: "/v1/providers", host: "trustedrouter.com"},
+		{method: http.MethodGet, path: "/v1/credits", host: "trustedrouter.com"},
+		{method: http.MethodPost, path: "/v1/auth/keys", host: "trustedrouter.com"},
+		{method: http.MethodGet, path: "/v1/broadcast/destinations", host: "trustedrouter.com"},
+		{method: http.MethodPost, path: "/v1/billing/checkout", host: "trustedrouter.com"},
+		{method: http.MethodPost, path: "/v1/chat/completions", host: "api.trustedrouter.com"},
+		{method: http.MethodPost, path: "/v1/messages", host: "api.trustedrouter.com"},
+		{method: http.MethodPost, path: "/v1/responses", host: "api.trustedrouter.com"},
+		{method: http.MethodPost, path: "/v1/embeddings", host: "api.trustedrouter.com"},
+	}
+	if len(seen) != len(want) {
+		t.Fatalf("seen = %#v", seen)
+	}
+	for i := range want {
+		if seen[i] != want[i] {
+			t.Fatalf("request %d = %#v, want %#v", i, seen[i], want[i])
+		}
+	}
+}
+
+func TestControlBaseURLOverride(t *testing.T) {
+	var seenURL string
+	sdk, err := NewClient(Options{
+		BaseURL:        "https://api.override.test/v1/",
+		ControlBaseURL: "https://control.override.test/v1/",
+		HTTPClient: newRoundTripClient(func(r *http.Request) (*http.Response, error) {
+			seenURL = r.URL.String()
+			return jsonResponse(http.StatusOK, map[string]any{"data": []any{}}, nil), nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sdk.BaseURL() != "https://api.override.test/v1" || sdk.ControlBaseURL() != "https://control.override.test/v1" {
+		t.Fatalf("bases = %q %q", sdk.BaseURL(), sdk.ControlBaseURL())
+	}
+	if _, err := sdk.Models(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if seenURL != "https://control.override.test/v1/models" {
+		t.Fatalf("models URL = %s", seenURL)
+	}
+	authorizeURL, err := sdk.OAuthAuthorizeURL(OAuthAuthorizeURLOptions{CallbackURL: "https://app.example/cb"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed := mustParseURL(t, authorizeURL)
+	if parsed.Scheme != "https" || parsed.Host != "control.override.test" || parsed.Path != "/v1/auth" {
+		t.Fatalf("authorize URL = %s", authorizeURL)
+	}
+}
+
+func TestControlRequestsDoNotUseRegionalFailover(t *testing.T) {
+	restore := stubSleep(func(context.Context, time.Duration) error { return nil })
+	defer restore()
+
+	var seenHosts []string
+	enabled := true
+	maxRetries := 1
+	sdk, err := NewClient(Options{
+		RegionalFailover: &enabled,
+		MaxRetries:       &maxRetries,
+		HTTPClient: newRoundTripClient(func(r *http.Request) (*http.Response, error) {
+			seenHosts = append(seenHosts, requestHost(r))
+			return jsonResponse(http.StatusServiceUnavailable, map[string]any{"error": map[string]any{"message": "down"}}, nil), nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = sdk.Models(context.Background(), nil)
+	var internal *InternalError
+	if !errors.As(err, &internal) || internal.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("expected final 503 InternalError, got %T %[1]v", err)
+	}
+	if got := strings.Join(seenHosts, ","); got != "trustedrouter.com,trustedrouter.com" {
+		t.Fatalf("control hosts = %#v", seenHosts)
 	}
 }
 
@@ -513,6 +666,29 @@ func TestRequestRetryAndErrorBehavior(t *testing.T) {
 		}
 	})
 
+	t.Run("400 401 404 no retry", func(t *testing.T) {
+		for _, status := range []int{http.StatusBadRequest, http.StatusUnauthorized, http.StatusNotFound} {
+			t.Run(http.StatusText(status), func(t *testing.T) {
+				maxRetries := 2
+				calls := 0
+				sdk, err := NewClient(Options{MaxRetries: &maxRetries, HTTPClient: newRoundTripClient(func(*http.Request) (*http.Response, error) {
+					calls++
+					return jsonResponse(status, map[string]any{"error": map[string]any{"message": "no retry"}}, nil), nil
+				})})
+				if err != nil {
+					t.Fatal(err)
+				}
+				err = sdk.Request(context.Background(), http.MethodGet, "/models", nil, nil, nil)
+				if err == nil {
+					t.Fatal("expected error")
+				}
+				if calls != 1 {
+					t.Fatalf("calls = %d", calls)
+				}
+			})
+		}
+	})
+
 	t.Run("retries exhausted returns last error", func(t *testing.T) {
 		maxRetries := 2
 		calls := 0
@@ -534,7 +710,7 @@ func TestRequestRetryAndErrorBehavior(t *testing.T) {
 	})
 }
 
-func TestTransportExhaustionWalksFailoverHosts(t *testing.T) {
+func TestTransportExhaustionRetriesApex(t *testing.T) {
 	restore := stubSleep(func(context.Context, time.Duration) error { return nil })
 	defer restore()
 
@@ -556,10 +732,10 @@ func TestTransportExhaustionWalksFailoverHosts(t *testing.T) {
 	if !errors.As(err, &internal) {
 		t.Fatalf("expected InternalError, got %T %[1]v", err)
 	}
-	if !strings.HasPrefix(internal.Message, "TrustedRouter regional endpoint unavailable: ") || !strings.Contains(internal.Message, "dial failed") {
+	if !strings.HasPrefix(internal.Message, "TrustedRouter endpoint unavailable: ") || !strings.Contains(internal.Message, "dial failed") {
 		t.Fatalf("message = %q", internal.Message)
 	}
-	wantHosts := "api.quillrouter.com,api-us-east4.quillrouter.com,api-europe-west4.quillrouter.com"
+	wantHosts := "api.trustedrouter.com,api.trustedrouter.com,api.trustedrouter.com"
 	if strings.Join(seenHosts, ",") != wantHosts {
 		t.Fatalf("hosts = %#v", seenHosts)
 	}
@@ -575,7 +751,6 @@ func TestRegionalFailoverAndChatIdempotency(t *testing.T) {
 	maxRetries := 1
 	sdk, err := NewClient(Options{
 		RegionalFailover: &enabled,
-		FailoverRegions:  []string{"europe-west4"},
 		MaxRetries:       &maxRetries,
 		HTTPClient: newRoundTripClient(func(r *http.Request) (*http.Response, error) {
 			seenHosts = append(seenHosts, r.URL.Host)
@@ -602,7 +777,7 @@ func TestRegionalFailoverAndChatIdempotency(t *testing.T) {
 	if strings.Join(tokens, "") != "OK" {
 		t.Fatalf("tokens = %#v", tokens)
 	}
-	if strings.Join(seenHosts, ",") != "api.quillrouter.com,api-europe-west4.quillrouter.com" {
+	if strings.Join(seenHosts, ",") != "api.trustedrouter.com,api.trustedrouter.com" {
 		t.Fatalf("hosts = %#v", seenHosts)
 	}
 	if len(seenKeys) != 2 || seenKeys[0] == "" || seenKeys[0] != seenKeys[1] || !strings.HasPrefix(seenKeys[0], "tr-req-") {
@@ -797,6 +972,13 @@ func (a pipeAddr) String() string {
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
 	return f(r)
+}
+
+func requestHost(r *http.Request) string {
+	if r.Host != "" {
+		return r.Host
+	}
+	return r.URL.Host
 }
 
 func newRoundTripClient(f roundTripFunc) *http.Client {

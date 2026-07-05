@@ -98,7 +98,7 @@ func (b *BroadcastDestination) UnmarshalJSON(data []byte) error {
 // BroadcastDestinations fetches configured broadcast destinations.
 func (c *Client) BroadcastDestinations(ctx context.Context, opts *BroadcastDestinationOptions) (*BroadcastDestinationList, error) {
 	var out BroadcastDestinationList
-	if err := c.Request(ctx, http.MethodGet, "/broadcast/destinations", nil, &out, broadcastDestinationCallOptions(opts)); err != nil {
+	if err := c.controlRequest(ctx, http.MethodGet, "/broadcast/destinations", nil, &out, broadcastDestinationCallOptions(opts)); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -111,7 +111,7 @@ func (c *Client) CreateBroadcastDestination(ctx context.Context, req BroadcastDe
 	if callOpts.WorkspaceID == nil {
 		callOpts.WorkspaceID = req.WorkspaceID
 	}
-	if err := c.Request(ctx, http.MethodPost, "/broadcast/destinations", broadcastDestinationBody(req), &out, &callOpts); err != nil {
+	if err := c.controlRequest(ctx, http.MethodPost, "/broadcast/destinations", broadcastDestinationBody(req), &out, &callOpts); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -120,7 +120,7 @@ func (c *Client) CreateBroadcastDestination(ctx context.Context, req BroadcastDe
 // GetBroadcastDestination fetches a broadcast destination by ID.
 func (c *Client) GetBroadcastDestination(ctx context.Context, id string, opts *BroadcastDestinationOptions) (*BroadcastDestination, error) {
 	var out BroadcastDestination
-	if err := c.Request(ctx, http.MethodGet, "/broadcast/destinations/"+id, nil, &out, broadcastDestinationCallOptions(opts)); err != nil {
+	if err := c.controlRequest(ctx, http.MethodGet, "/broadcast/destinations/"+id, nil, &out, broadcastDestinationCallOptions(opts)); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -130,7 +130,7 @@ func (c *Client) GetBroadcastDestination(ctx context.Context, id string, opts *B
 func (c *Client) UpdateBroadcastDestination(ctx context.Context, id string, patch map[string]any) (*BroadcastDestination, error) {
 	var out BroadcastDestination
 	body, callOpts := broadcastDestinationPatchBodyAndOptions(patch)
-	if err := c.Request(ctx, http.MethodPatch, "/broadcast/destinations/"+id, body, &out, callOpts); err != nil {
+	if err := c.controlRequest(ctx, http.MethodPatch, "/broadcast/destinations/"+id, body, &out, callOpts); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -139,7 +139,7 @@ func (c *Client) UpdateBroadcastDestination(ctx context.Context, id string, patc
 // DeleteBroadcastDestination deletes a broadcast destination by ID.
 func (c *Client) DeleteBroadcastDestination(ctx context.Context, id string, opts *BroadcastDestinationOptions) (map[string]any, error) {
 	var out map[string]any
-	if err := c.Request(ctx, http.MethodDelete, "/broadcast/destinations/"+id, nil, &out, broadcastDestinationCallOptions(opts)); err != nil {
+	if err := c.controlRequest(ctx, http.MethodDelete, "/broadcast/destinations/"+id, nil, &out, broadcastDestinationCallOptions(opts)); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -148,7 +148,7 @@ func (c *Client) DeleteBroadcastDestination(ctx context.Context, id string, opts
 // TestBroadcastDestination sends a test event through a broadcast destination.
 func (c *Client) TestBroadcastDestination(ctx context.Context, id string, opts *BroadcastDestinationOptions) (map[string]any, error) {
 	var out map[string]any
-	if err := c.Request(ctx, http.MethodPost, "/broadcast/destinations/"+id+"/test", nil, &out, broadcastDestinationCallOptions(opts)); err != nil {
+	if err := c.controlRequest(ctx, http.MethodPost, "/broadcast/destinations/"+id+"/test", nil, &out, broadcastDestinationCallOptions(opts)); err != nil {
 		return nil, err
 	}
 	return out, nil

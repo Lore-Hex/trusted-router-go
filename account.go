@@ -166,7 +166,7 @@ func (a *Activity) UnmarshalJSON(data []byte) error {
 // AuthSession fetches the current auth session.
 func (c *Client) AuthSession(ctx context.Context) (*AuthSessionResponse, error) {
 	var out AuthSessionResponse
-	if err := c.Request(ctx, http.MethodGet, "/auth/session", nil, &out, nil); err != nil {
+	if err := c.controlRequest(ctx, http.MethodGet, "/auth/session", nil, &out, nil); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -175,7 +175,7 @@ func (c *Client) AuthSession(ctx context.Context) (*AuthSessionResponse, error) 
 // Logout logs out the current auth session.
 func (c *Client) Logout(ctx context.Context) (*LogoutResponse, error) {
 	var out LogoutResponse
-	if err := c.Request(ctx, http.MethodPost, "/auth/logout", nil, &out, nil); err != nil {
+	if err := c.controlRequest(ctx, http.MethodPost, "/auth/logout", nil, &out, nil); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -184,7 +184,7 @@ func (c *Client) Logout(ctx context.Context) (*LogoutResponse, error) {
 // UserInfo fetches the OIDC-style profile for the configured key.
 func (c *Client) UserInfo(ctx context.Context) (*UserInfoResponse, error) {
 	var out UserInfoResponse
-	if err := c.Request(ctx, http.MethodGet, "/auth/userinfo", nil, &out, nil); err != nil {
+	if err := c.controlRequest(ctx, http.MethodGet, "/auth/userinfo", nil, &out, nil); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -193,7 +193,7 @@ func (c *Client) UserInfo(ctx context.Context) (*UserInfoResponse, error) {
 // Activity lists recent generations for the authenticated key/workspace.
 func (c *Client) Activity(ctx context.Context, params map[string]string) (*ActivityResponse, error) {
 	var out ActivityResponse
-	if err := c.Request(ctx, http.MethodGet, activityPath(params), nil, &out, nil); err != nil {
+	if err := c.controlRequest(ctx, http.MethodGet, activityPath(params), nil, &out, nil); err != nil {
 		return nil, err
 	}
 	return &out, nil

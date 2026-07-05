@@ -56,7 +56,7 @@ func (c *Client) BillingCheckout(ctx context.Context, req BillingCheckoutRequest
 	if callOpts.WorkspaceID == nil {
 		callOpts.WorkspaceID = req.WorkspaceID
 	}
-	if err := c.Request(ctx, http.MethodPost, "/billing/checkout", billingCheckoutBody(req), &out, &callOpts); err != nil {
+	if err := c.controlRequest(ctx, http.MethodPost, "/billing/checkout", billingCheckoutBody(req), &out, &callOpts); err != nil {
 		return nil, err
 	}
 	return &out, nil

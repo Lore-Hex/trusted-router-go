@@ -32,7 +32,10 @@ func TestRandomOAuthStateAndPKCEGolden(t *testing.T) {
 }
 
 func TestOAuthAuthorizeURLGoldenMatrix(t *testing.T) {
-	client, err := NewClient(Options{BaseURL: "https://gw.internal/v1/"})
+	client, err := NewClient(Options{
+		BaseURL:        "https://gw.internal/v1/",
+		ControlBaseURL: "https://control.internal/v1/",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +59,7 @@ func TestOAuthAuthorizeURLGoldenMatrix(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if parsed.Scheme != "https" || parsed.Host != "gw.internal" || parsed.Path != "/v1/auth" {
+	if parsed.Scheme != "https" || parsed.Host != "control.internal" || parsed.Path != "/v1/auth" {
 		t.Fatalf("authorize URL = %s", full)
 	}
 	query := parsed.Query()
