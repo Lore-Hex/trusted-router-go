@@ -24,6 +24,12 @@ const GCPIssuer = "https://confidentialcomputing.googleapis.com"
 // GCPJWKSURI is Google's public JWKS for the Confidential Space signer.
 const GCPJWKSURI = "https://www.googleapis.com/service_accounts/v1/metadata/jwk/signer@confidentialspace-sign.iam.gserviceaccount.com"
 
+// ExporterLabel is the RFC 9266 tls-exporter channel-binding label committed by G6.
+const ExporterLabel = "EXPORTER-Channel-Binding"
+
+// ExporterLength is the byte length of the G6 TLS exporter channel binding.
+const ExporterLength = 32
+
 const defaultAttestationAudience = "quill-cloud"
 
 // AttestationVerificationError reports a failed attestation trust check.
@@ -205,6 +211,10 @@ type VerifyGatewayAttestationOptions struct {
 	NonceHex string
 	// TLSCertDER is the live TLS leaf cert in DER form. When set, its SHA-256 must match the JWT.
 	TLSCertDER []byte
+	// TLSExporter is the RFC 9266 exporter derived on the SAME TLS connection that fetched the document.
+	// When set, its hex must be bound in the JWT nonce list and NonceHex must be a fresh,
+	// distinct value that is also bound; this closes the G6 single-slot relay attack.
+	TLSExporter []byte
 	// JWKS is a pre-fetched JWKS. Nil fetches JWKSURL.
 	JWKS map[string]any
 	// JWKSURL is fetched when JWKS is nil. Empty uses GCPJWKSURI.
@@ -276,7 +286,7 @@ func VerifyGatewayAttestation(ctx context.Context, document []byte, opts VerifyG
 	if err := verifyRS256(jwks, header, signingInput, signature); err != nil {
 		return nil, err
 	}
-	return checkAttestationClaims(payload, opts.Policy, opts.NonceHex, opts.TLSCertDER)
+	return checkAttestationClaims(payload, opts.Policy, opts.NonceHex, opts.TLSCertDER, opts.TLSExporter)
 }
 
 func attestationURL(baseURL string) string {
@@ -481,7 +491,7 @@ func jwksKeys(jwks map[string]any) ([]map[string]any, bool) {
 	}
 }
 
-func checkAttestationClaims(claims map[string]any, policy AttestationPolicy, nonceHex string, tlsCertDER []byte) (*GatewayAttestation, error) {
+func checkAttestationClaims(claims map[string]any, policy AttestationPolicy, nonceHex string, tlsCertDER []byte, tlsExporter []byte) (*GatewayAttestation, error) {
 	now := time.Now().Unix()
 	expValue, expOK := intClaim(claims["exp"])
 	if expOK && expValue <= now {
@@ -516,12 +526,26 @@ func checkAttestationClaims(claims map[string]any, policy AttestationPolicy, non
 
 	nonces := nonceList(claims)
 	var nonceMatch *string
+	if len(tlsExporter) > 0 && nonceHex == "" {
+		return nil, attestationErr("fresh nonce required with exporter binding", nil)
+	}
 	if nonceHex != "" {
 		if !containsString(nonces, nonceHex) {
 			return nil, attestationErr(fmt.Sprintf("nonce %s not present in JWT nonces %s", pyRepr(nonceHex), pyRepr(nonces)), nil)
 		}
 		nonce := nonceHex
 		nonceMatch = &nonce
+	}
+	if len(tlsExporter) > 0 {
+		exporterHex := fmt.Sprintf("%x", tlsExporter)
+		if !containsString(nonces, exporterHex) {
+			return nil, attestationErr(fmt.Sprintf("TLS exporter %s not present in JWT nonces %s", pyRepr(exporterHex), pyRepr(nonces)), nil)
+		}
+		// G6/RFC 9266 relay closure: the caller nonce must consume the enclave's
+		// one external nonce slot independently from the TLS exporter commitment.
+		if safeEq(nonceHex, exporterHex) {
+			return nil, attestationErr("fresh nonce must be distinct from TLS exporter for G6 relay closure", nil)
+		}
 	}
 
 	certSHA, _ := claims["tls_cert_sha256"].(string)

@@ -80,6 +80,72 @@ func TestVerifyGatewayAttestationCertInNonces(t *testing.T) {
 	}
 }
 
+func TestCheckAttestationClaimsTLSExporterBinding(t *testing.T) {
+	fixture := newAttestationFixture(t)
+	exporter := make([]byte, ExporterLength)
+	for i := range exporter {
+		exporter[i] = byte(i + 1)
+	}
+	exporterHex := base16(exporter)
+	freshNonce := strings.Repeat("12", ExporterLength)
+
+	tests := []struct {
+		name      string
+		nonces    []string
+		nonceHex  string
+		wantError string
+	}{
+		{
+			name:     "fresh nonce and exporter present and distinct",
+			nonces:   []string{fixture.certSHA, "device-blob-hash", exporterHex, freshNonce},
+			nonceHex: freshNonce,
+		},
+		{
+			name:      "exporter absent",
+			nonces:    []string{fixture.certSHA, freshNonce},
+			nonceHex:  freshNonce,
+			wantError: "TLS exporter",
+		},
+		{
+			name:      "fresh nonce empty",
+			nonces:    []string{fixture.certSHA, exporterHex, freshNonce},
+			wantError: "fresh nonce required with exporter binding",
+		},
+		{
+			name:      "relay exporter laundered through caller nonce",
+			nonces:    []string{fixture.certSHA, exporterHex},
+			nonceHex:  exporterHex,
+			wantError: "fresh nonce must be distinct from TLS exporter",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			claims := fixture.claims(map[string]any{"eat_nonce": tt.nonces})
+			got, err := checkAttestationClaims(claims, fixture.policy, tt.nonceHex, fixture.certDER, exporter)
+			if tt.wantError == "" {
+				if err != nil {
+					t.Fatalf("checkAttestationClaims returned error: %v", err)
+				}
+				if got.Nonce == nil || *got.Nonce != freshNonce {
+					t.Fatalf("Nonce = %#v, want %q", got.Nonce, freshNonce)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("checkAttestationClaims returned nil error")
+			}
+			var attErr *AttestationVerificationError
+			if !errors.As(err, &attErr) {
+				t.Fatalf("error type = %T, want AttestationVerificationError", err)
+			}
+			if !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("error = %q, want substring %q", err.Error(), tt.wantError)
+			}
+		})
+	}
+}
+
 func TestVerifyGatewayAttestationRejections(t *testing.T) {
 	fixture := newAttestationFixture(t)
 
