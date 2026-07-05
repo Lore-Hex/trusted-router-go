@@ -183,6 +183,7 @@ func (c *Client) BaseURLs() []string {
 }
 
 // Request sends an API request, retries reference retryable responses, and decodes JSON into out.
+// json.RawMessage and []byte bodies are sent verbatim.
 func (c *Client) Request(ctx context.Context, method, path string, body any, out any, opts *CallOptions) error {
 	resp, err := c.rawRequest(ctx, method, path, body, opts)
 	if err != nil {
@@ -193,6 +194,7 @@ func (c *Client) Request(ctx context.Context, method, path string, body any, out
 }
 
 // RawRequest sends an API request and returns the final raw HTTP response after retry handling.
+// json.RawMessage and []byte bodies are sent verbatim.
 // The caller must close the returned response body.
 func (c *Client) RawRequest(ctx context.Context, method, path string, body any, opts *CallOptions) (*http.Response, error) {
 	return c.rawRequest(ctx, method, path, body, opts)
@@ -337,6 +339,12 @@ func stringInSlice(needle string, haystack []string) bool {
 func marshalRequestBody(body any) ([]byte, bool, error) {
 	if body == nil {
 		return nil, false, nil
+	}
+	switch value := body.(type) {
+	case json.RawMessage:
+		return value, true, nil
+	case []byte:
+		return value, true, nil
 	}
 	data, err := json.Marshal(body)
 	if err != nil {

@@ -17,6 +17,14 @@ type ModelListOptions struct {
 	ProviderRegion string
 }
 
+// CreditsOptions configures a TrustedRouter credits request.
+type CreditsOptions struct {
+	// WorkspaceID overrides the client workspace selector. Nil inherits the client default; a pointer to "" suppresses the workspace header.
+	WorkspaceID *string
+	// CallOptions configures per-call headers, auth, workspace, idempotency, and timeout.
+	CallOptions
+}
+
 // ModelList is the response returned by the models endpoint.
 type ModelList struct {
 	// Data is the catalog page of models.
@@ -205,10 +213,149 @@ func (m *ModelTopProvider) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// ProviderList is the response returned by the providers endpoint.
+type ProviderList struct {
+	// Data is the provider catalog.
+	Data []ProviderInfo `json:"data"`
+	// Extra contains unknown top-level response fields.
+	Extra map[string]any `json:"-"`
+}
+
+// UnmarshalJSON decodes a provider list and preserves unknown fields in Extra.
+func (p *ProviderList) UnmarshalJSON(data []byte) error {
+	type alias ProviderList
+	var out alias
+	if err := json.Unmarshal(data, &out); err != nil {
+		return err
+	}
+	*p = ProviderList(out)
+	p.Extra = extraFields(data, "data")
+	return nil
+}
+
+// ProviderInfo is one TrustedRouter provider catalog entry.
+type ProviderInfo struct {
+	// ID is the provider identifier.
+	ID string `json:"id"`
+	// Name is the display name.
+	Name string `json:"name,omitempty"`
+	// Extra contains unknown provider fields.
+	Extra map[string]any `json:"-"`
+}
+
+// UnmarshalJSON decodes a provider entry and preserves unknown fields in Extra.
+func (p *ProviderInfo) UnmarshalJSON(data []byte) error {
+	type alias ProviderInfo
+	var out alias
+	if err := json.Unmarshal(data, &out); err != nil {
+		return err
+	}
+	*p = ProviderInfo(out)
+	p.Extra = extraFields(data, "id", "name")
+	return nil
+}
+
+// RegionList is the response returned by the regions endpoint.
+type RegionList struct {
+	// Data is the region catalog.
+	Data []RegionInfo `json:"data"`
+	// Extra contains unknown top-level response fields.
+	Extra map[string]any `json:"-"`
+}
+
+// UnmarshalJSON decodes a region list and preserves unknown fields in Extra.
+func (r *RegionList) UnmarshalJSON(data []byte) error {
+	type alias RegionList
+	var out alias
+	if err := json.Unmarshal(data, &out); err != nil {
+		return err
+	}
+	*r = RegionList(out)
+	r.Extra = extraFields(data, "data")
+	return nil
+}
+
+// RegionInfo is one TrustedRouter region catalog entry.
+type RegionInfo struct {
+	// ID is the region identifier.
+	ID string `json:"id"`
+	// Name is the display name.
+	Name string `json:"name,omitempty"`
+	// Extra contains unknown region fields.
+	Extra map[string]any `json:"-"`
+}
+
+// UnmarshalJSON decodes a region entry and preserves unknown fields in Extra.
+func (r *RegionInfo) UnmarshalJSON(data []byte) error {
+	type alias RegionInfo
+	var out alias
+	if err := json.Unmarshal(data, &out); err != nil {
+		return err
+	}
+	*r = RegionInfo(out)
+	r.Extra = extraFields(data, "id", "name")
+	return nil
+}
+
+// CreditsBalance is the response returned by the credits endpoint.
+type CreditsBalance struct {
+	// Data contains the gateway credits payload.
+	Data any `json:"data"`
+	// Extra contains unknown top-level response fields.
+	Extra map[string]any `json:"-"`
+}
+
+// UnmarshalJSON decodes a credits response and preserves unknown fields in Extra.
+func (c *CreditsBalance) UnmarshalJSON(data []byte) error {
+	type alias CreditsBalance
+	var out alias
+	if err := json.Unmarshal(data, &out); err != nil {
+		return err
+	}
+	*c = CreditsBalance(out)
+	c.Extra = extraFields(data, "data")
+	return nil
+}
+
 // Models fetches the TrustedRouter model catalog.
 func (c *Client) Models(ctx context.Context, opts *ModelListOptions) (*ModelList, error) {
 	var out ModelList
 	if err := c.Request(ctx, http.MethodGet, modelsPath(opts), nil, &out, nil); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// Providers fetches the TrustedRouter provider catalog.
+func (c *Client) Providers(ctx context.Context) (*ProviderList, error) {
+	var out ProviderList
+	if err := c.Request(ctx, http.MethodGet, "/providers", nil, &out, nil); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// Regions fetches the TrustedRouter region catalog.
+func (c *Client) Regions(ctx context.Context) (*RegionList, error) {
+	var out RegionList
+	if err := c.Request(ctx, http.MethodGet, "/regions", nil, &out, nil); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// Credits fetches the TrustedRouter credits balance.
+func (c *Client) Credits(ctx context.Context, opts *CreditsOptions) (*CreditsBalance, error) {
+	var out CreditsBalance
+	var callOpts *CallOptions
+	if opts != nil {
+		value := opts.CallOptions
+		if value.WorkspaceID == nil {
+			value.WorkspaceID = opts.WorkspaceID
+		}
+		callOpts = &value
+	}
+	if err := c.Request(ctx, http.MethodGet, "/credits", nil, &out, callOpts); err != nil {
 		return nil, err
 	}
 	return &out, nil

@@ -712,9 +712,13 @@ func (c *Client) chatCompletionsChunks(ctx context.Context, req ChatRequest, inc
 
 func (c *Client) openChatStream(ctx context.Context, req ChatRequest, includeUsage bool) (*http.Response, error) {
 	callOpts := chatCallOptions(req)
+	body := buildChatBody(req, includeUsage)
+	return c.openEventStream(ctx, http.MethodPost, "/chat/completions", body, callOpts)
+}
+
+func (c *Client) openEventStream(ctx context.Context, method, path string, body any, callOpts CallOptions) (*http.Response, error) {
 	timeout, hasTimeout := c.effectiveTimeout(&callOpts)
 
-	body := buildChatBody(req, includeUsage)
 	bodyBytes, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
@@ -742,8 +746,8 @@ func (c *Client) openChatStream(ctx context.Context, req ChatRequest, includeUsa
 				cancelAttempt(errOpenTimeout)
 			})
 		}
-		url := joinURL(c.baseURLs[baseIndex], "/chat/completions")
-		httpReq, err := c.newHTTPRequest(attemptCtx, http.MethodPost, url, bodyBytes, true, &callOpts)
+		url := joinURL(c.baseURLs[baseIndex], path)
+		httpReq, err := c.newHTTPRequest(attemptCtx, method, url, bodyBytes, true, &callOpts)
 		if err != nil {
 			stopTimer(openTimer)
 			cancelAttempt(nil)

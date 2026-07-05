@@ -9,7 +9,6 @@ import (
 	"strings"
 )
 
-//lint:ignore U1000 wired to the Responses API in increment 2
 func iterSSEEvents(r io.Reader) iter.Seq2[map[string]any, error] {
 	return func(yield func(map[string]any, error) bool) {
 		// Divergence from trusted-router-py: bare-\r SSE line endings are unsupported.
@@ -94,17 +93,17 @@ func isSSEDoneLine(line string) bool {
 	return strings.TrimSpace(line[len("data: "):]) == "[DONE]"
 }
 
-//lint:ignore U1000 wired to the Responses API in increment 2
 func eventFromSSEFrame(lines []string) map[string]any {
 	if len(lines) == 0 {
 		return nil
 	}
-	var eventName string
+	var eventName *string
 	var dataParts []string
 	for _, line := range lines {
 		switch {
 		case strings.HasPrefix(line, "event:"):
-			eventName = strings.TrimSpace(line[len("event:"):])
+			name := strings.TrimSpace(line[len("event:"):])
+			eventName = &name
 		case strings.HasPrefix(line, "data:"):
 			dataParts = append(dataParts, strings.TrimSpace(line[len("data:"):]))
 		}
@@ -120,11 +119,15 @@ func eventFromSSEFrame(lines []string) map[string]any {
 	}
 	obj, ok := payload.(map[string]any)
 	if !ok {
-		return map[string]any{"event": eventName, "data": payload}
+		var event any
+		if eventName != nil {
+			event = *eventName
+		}
+		return map[string]any{"event": event, "data": payload}
 	}
-	if eventName != "" {
+	if eventName != nil && *eventName != "" {
 		if _, exists := obj["event"]; !exists {
-			withEvent := map[string]any{"event": eventName}
+			withEvent := map[string]any{"event": *eventName}
 			for key, value := range obj {
 				withEvent[key] = value
 			}

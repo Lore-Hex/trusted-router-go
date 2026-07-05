@@ -1,11 +1,14 @@
 package trustedrouter
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"runtime"
 	"strings"
 	"sync"
@@ -261,6 +264,97 @@ func TestCallOptionsTimeoutSetsRequestDeadline(t *testing.T) {
 	}
 	if !sawDeadline {
 		t.Fatal("per-call timeout did not set a request deadline")
+	}
+}
+
+func TestRawRequestSendsRawBodiesVerbatim(t *testing.T) {
+	rawBody := []byte("{\n  \"html\": \"<b> & " + "\u2028" + "\"\n}\n")
+
+	for _, tc := range []struct {
+		name string
+		body any
+	}{
+		{name: "json.RawMessage", body: json.RawMessage(rawBody)},
+		{name: "[]byte", body: rawBody},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			captures := make(chan requestCapture, 1)
+			server, client := newPipeHTTPTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				data, err := io.ReadAll(r.Body)
+				captures <- requestCapture{
+					body:        data,
+					contentType: r.Header.Get("Content-Type"),
+					err:         err,
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"ok":true}`))
+			}))
+
+			sdk, err := NewClient(Options{BaseURL: server.URL, HTTPClient: client})
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp, err := sdk.RawRequest(context.Background(), http.MethodPost, "/passthrough", tc.body, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+				t.Fatal(err)
+			}
+
+			capture := <-captures
+			if capture.err != nil {
+				t.Fatal(capture.err)
+			}
+			if !bytes.Equal(capture.body, rawBody) {
+				t.Fatalf("body = %q, want byte-identical %q", capture.body, rawBody)
+			}
+			if capture.contentType != "application/json" {
+				t.Fatalf("content-type = %q", capture.contentType)
+			}
+		})
+	}
+}
+
+func TestRawRequestMarshalsStructBody(t *testing.T) {
+	body := struct {
+		HTML string `json:"html"`
+	}{
+		HTML: "<b> & \u2028",
+	}
+	want, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	captures := make(chan requestCapture, 1)
+	server, client := newPipeHTTPTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		data, err := io.ReadAll(r.Body)
+		captures <- requestCapture{body: data, err: err}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+
+	sdk, err := NewClient(Options{BaseURL: server.URL, HTTPClient: client})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := sdk.RawRequest(context.Background(), http.MethodPost, "/passthrough", body, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		t.Fatal(err)
+	}
+
+	capture := <-captures
+	if capture.err != nil {
+		t.Fatal(capture.err)
+	}
+	if !bytes.Equal(capture.body, want) {
+		t.Fatalf("body = %q, want json.Marshal output %q", capture.body, want)
 	}
 }
 
@@ -616,6 +710,90 @@ func TestErrorMessageParity(t *testing.T) {
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
+
+type requestCapture struct {
+	body        []byte
+	contentType string
+	err         error
+}
+
+func newPipeHTTPTestServer(t *testing.T, handler http.Handler) (*httptest.Server, *http.Client) {
+	t.Helper()
+	listener := newPipeListener()
+	server := &httptest.Server{
+		Listener: listener,
+		Config:   &http.Server{Handler: handler},
+	}
+	server.Start()
+	transport := &http.Transport{DialContext: listener.dial}
+	t.Cleanup(func() {
+		transport.CloseIdleConnections()
+		server.Close()
+	})
+	return server, &http.Client{Transport: transport}
+}
+
+type pipeListener struct {
+	conns chan net.Conn
+	done  chan struct{}
+	addr  net.Addr
+}
+
+func newPipeListener() *pipeListener {
+	return &pipeListener{
+		conns: make(chan net.Conn),
+		done:  make(chan struct{}),
+		addr:  pipeAddr("trusted-router.test"),
+	}
+}
+
+func (l *pipeListener) Accept() (net.Conn, error) {
+	select {
+	case conn := <-l.conns:
+		return conn, nil
+	case <-l.done:
+		return nil, net.ErrClosed
+	}
+}
+
+func (l *pipeListener) Close() error {
+	select {
+	case <-l.done:
+	default:
+		close(l.done)
+	}
+	return nil
+}
+
+func (l *pipeListener) Addr() net.Addr {
+	return l.addr
+}
+
+func (l *pipeListener) dial(ctx context.Context, _, _ string) (net.Conn, error) {
+	clientConn, serverConn := net.Pipe()
+	select {
+	case l.conns <- serverConn:
+		return clientConn, nil
+	case <-l.done:
+		_ = clientConn.Close()
+		_ = serverConn.Close()
+		return nil, net.ErrClosed
+	case <-ctx.Done():
+		_ = clientConn.Close()
+		_ = serverConn.Close()
+		return nil, ctx.Err()
+	}
+}
+
+type pipeAddr string
+
+func (a pipeAddr) Network() string {
+	return "pipe"
+}
+
+func (a pipeAddr) String() string {
+	return string(a)
+}
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
 	return f(r)
