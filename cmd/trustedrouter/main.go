@@ -76,7 +76,7 @@ Usage:
   trustedrouter [--base-url URL] [--control-base-url URL] [--retries N] providers
   trustedrouter [--base-url URL] [--control-base-url URL] [--retries N] regions
   trustedrouter trust
-  trustedrouter [--base-url URL] [--control-base-url URL] [--retries N] attest [--verify]
+  trustedrouter [--base-url URL] [--control-base-url URL] [--retries N] attest [--verify] [--session] [--connect-ip IP]
 
 Reads bearer from $TRUSTEDROUTER_API_KEY or $TR_API_KEY.
 `, trustedrouter.Version)
@@ -192,13 +192,24 @@ func cmdAttest(ctx context.Context, globals globalOptions, argv []string) int {
 	fs := flag.NewFlagSet("trustedrouter attest", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	verify := false
+	sessionMode := false
+	connectIP := ""
 	fs.BoolVar(&verify, "verify", false, "verify against the trust release; TLS-cert binding is fetched over a second connection, so it proves the host presented the attested cert on some connection, not necessarily the doc-serving one")
+	fs.BoolVar(&sessionMode, "session", false, "verify the G6 TLS-exporter binding on a live pinned TLS session")
+	fs.StringVar(&connectIP, "connect-ip", "", "dial this IP for --session while keeping SNI and Host from --base-url")
 	if err := fs.Parse(argv); err != nil {
 		return 2
 	}
 	client, err := newClient(globals)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 2
+	}
+	if sessionMode {
+		return cmdAttestSession(ctx, client.BaseURL(), connectIP)
+	}
+	if connectIP != "" {
+		fmt.Fprintln(os.Stderr, "error: --connect-ip requires --session")
 		return 2
 	}
 	doc, err := client.Attestation(ctx)
@@ -228,6 +239,42 @@ func cmdAttest(ctx context.Context, globals globalOptions, argv []string) int {
 		return 1
 	}
 	return printJSON(result.AsMap())
+}
+
+func cmdAttestSession(ctx context.Context, baseURL string, connectIP string) int {
+	policy, err := trustedrouter.PolicyFromTrustRelease(ctx, trustedrouter.PolicyFromTrustReleaseOptions{})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+	session, err := trustedrouter.VerifyGatewaySession(ctx, trustedrouter.VerifyGatewaySessionOptions{
+		BaseURL:   baseURL,
+		Policy:    policy,
+		ConnectIP: connectIP,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+	defer session.Conn.Close()
+
+	fmt.Println("JWT ok")
+	fmt.Printf("image_digest ok: %s\n", session.Attestation.ImageDigest)
+	fmt.Printf("cert-fp bound: %s\n", session.Attestation.CertSHA256)
+	if session.Attestation.Nonce != nil {
+		fmt.Printf("fresh nonce bound: %s\n", *session.Attestation.Nonce)
+	} else {
+		fmt.Println("fresh nonce bound: <missing>")
+	}
+	fmt.Printf("exporter bound: %x\n", session.Exporter)
+	fmt.Printf("dbgstat: %v\n", session.Attestation.RawClaims["dbgstat"])
+
+	if _, err := session.FetchAttestationAgain(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "error: follow-up attestation on pinned session failed: %v\n", err)
+		return 1
+	}
+	fmt.Println("pin ok: follow-up stayed on the attested session")
+	return 0
 }
 
 func fetchTLSCertDER(ctx context.Context, baseURL string) ([]byte, error) {
