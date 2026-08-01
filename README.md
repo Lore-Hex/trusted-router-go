@@ -5,6 +5,10 @@ surfaces on `https://api.trustedrouter.com/v1`, Anthropic-style messages,
 Fusion orchestration, control-plane helpers on `https://trustedrouter.com/v1`,
 OAuth delegated-key helpers, and gateway attestation verification.
 
+The package also exposes the same stable routing/privacy aliases and five
+atomic orchestration builders as the other official SDKs: Synth, Advisor,
+Selector, MapReduce, and Subagent.
+
 ## Install
 
 ```sh
@@ -45,6 +49,24 @@ func main() {
 	fmt.Println(*resp.Choices[0].Message.Content)
 }
 ```
+
+## Privacy and orchestration
+
+Privacy and US provider-jurisdiction requirements are typed provider
+preferences and remain hard constraints even when a model is explicit. Use
+`EUModel` for the EU-focused routing pool:
+
+```go
+request := trustedrouter.ChatRequest{
+	Model:    "z-ai/glm-5.2",
+	Messages: []map[string]any{{"role": "user", "content": "Review this contract."}},
+	Provider: trustedrouter.ConfidentialProvider(),
+}
+```
+
+Use `FusionTool`, `AdvisorTool`, `SelectorTool`, `MapReduceTool`, or
+`SubagentTool` to build custom orchestration. Stable named models and privacy
+aliases are exported from `constants.go`.
 
 Streaming text:
 

@@ -301,7 +301,7 @@ func handleGatewaySessionOneShotTestConn(rawConn net.Conn, cert tls.Certificate,
 	claims := fixture.claims(map[string]any{
 		"eat_nonce":       nonces,
 		"tls_cert_sha256": certSHA,
-		"dbgstat":         "disabled",
+		"dbgstat":         "disabled-since-boot",
 	})
 	signMu.Lock()
 	token, err := mintGatewaySessionTestJWT(fixture, claims)
@@ -389,7 +389,7 @@ func handleGatewaySessionTestConn(rawConn net.Conn, cert tls.Certificate, fixtur
 		claims := fixture.claims(map[string]any{
 			"eat_nonce":       nonces,
 			"tls_cert_sha256": certSHA,
-			"dbgstat":         "disabled",
+			"dbgstat":         "disabled-since-boot",
 		})
 		signMu.Lock()
 		token, err := mintGatewaySessionTestJWT(fixture, claims)

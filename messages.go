@@ -12,6 +12,8 @@ type MessagesRequest struct {
 	Model string
 	// Messages is the Anthropic-compatible messages array.
 	Messages []map[string]any
+	// Provider configures typed provider routing and privacy requirements.
+	Provider *ProviderPreferences
 	// MaxTokens is the maximum number of output tokens. Nil uses the reference default of 1024.
 	MaxTokens *int
 	// Extra contains additional JSON body fields to forward to TrustedRouter.
@@ -162,6 +164,9 @@ func buildMessagesBody(req MessagesRequest) map[string]any {
 		"model":      req.Model,
 		"messages":   req.Messages,
 		"max_tokens": maxTokens,
+	}
+	if req.Provider != nil {
+		body["provider"] = req.Provider
 	}
 	for key, value := range req.Extra {
 		body[key] = value

@@ -13,6 +13,8 @@ type EmbeddingsRequest struct {
 	Model string
 	// Input is a string, string slice, token slice, or batch of token slices.
 	Input any
+	// Provider configures typed provider routing and privacy requirements.
+	Provider *ProviderPreferences
 	// EncodingFormat requests the embedding encoding format.
 	EncodingFormat *string
 	// Dimensions requests a reduced embedding dimension count.
@@ -184,6 +186,9 @@ func buildEmbeddingsBody(req EmbeddingsRequest) map[string]any {
 	body := map[string]any{
 		"model": req.Model,
 		"input": req.Input,
+	}
+	if req.Provider != nil {
+		body["provider"] = req.Provider
 	}
 	if req.EncodingFormat != nil {
 		body["encoding_format"] = *req.EncodingFormat
