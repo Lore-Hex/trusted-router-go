@@ -14,6 +14,8 @@ type ResponsesRequest struct {
 	Model string
 	// Input is a string or Responses-compatible input item array.
 	Input any
+	// Provider configures typed provider routing and privacy requirements.
+	Provider *ProviderPreferences
 	// Instructions are optional system or developer instructions.
 	Instructions *string
 	// Extra contains additional JSON body fields to forward to TrustedRouter.
@@ -204,6 +206,9 @@ func buildResponsesBody(req ResponsesRequest, stream bool) map[string]any {
 	}
 	if req.Instructions != nil {
 		body["instructions"] = *req.Instructions
+	}
+	if req.Provider != nil {
+		body["provider"] = req.Provider
 	}
 	return body
 }

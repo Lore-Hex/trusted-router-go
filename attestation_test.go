@@ -152,6 +152,9 @@ func TestVerifyGatewayAttestationRejections(t *testing.T) {
 	badSig := corruptJWTSignature(t, fixture.mint(t, fixture.claims(nil)))
 	wrongIssuer := fixture.mint(t, fixture.claims(map[string]any{"iss": "https://example.invalid"}))
 	expired := fixture.mint(t, fixture.claims(map[string]any{"exp": time.Now().Add(-time.Minute).Unix()}))
+	missingExpiration := fixture.mint(t, fixture.claims(map[string]any{"exp": nil}))
+	debugEnabled := fixture.mint(t, fixture.claims(map[string]any{"dbgstat": "enabled"}))
+	missingSecureBoot := fixture.mint(t, fixture.claims(map[string]any{"secboot": nil}))
 	good := fixture.mint(t, fixture.claims(nil))
 
 	tests := []struct {
@@ -185,6 +188,30 @@ func TestVerifyGatewayAttestationRejections(t *testing.T) {
 			nonceHex:  fixture.nonce,
 			certDER:   fixture.certDER,
 			wantError: "JWT expired at",
+		},
+		{
+			name:      "missing expiration",
+			token:     missingExpiration,
+			policy:    fixture.policy,
+			nonceHex:  fixture.nonce,
+			certDER:   fixture.certDER,
+			wantError: "valid expiration",
+		},
+		{
+			name:      "debug image",
+			token:     debugEnabled,
+			policy:    fixture.policy,
+			nonceHex:  fixture.nonce,
+			certDER:   fixture.certDER,
+			wantError: "disabled-since-boot",
+		},
+		{
+			name:      "missing secure boot",
+			token:     missingSecureBoot,
+			policy:    fixture.policy,
+			nonceHex:  fixture.nonce,
+			certDER:   fixture.certDER,
+			wantError: "Secure Boot",
 		},
 		{
 			name:  "digest mismatch",
@@ -236,6 +263,18 @@ func TestVerifyGatewayAttestationRejections(t *testing.T) {
 				t.Fatalf("error = %q, want substring %q", err.Error(), tt.wantError)
 			}
 		})
+	}
+}
+
+func TestVerifyGatewayAttestationAllowsDebugOnlyWhenExplicit(t *testing.T) {
+	fixture := newAttestationFixture(t)
+	policy := fixture.policy
+	policy.AllowDebug = true
+	token := fixture.mint(t, fixture.claims(map[string]any{"dbgstat": "enabled"}))
+	if _, err := VerifyGatewayAttestation(context.Background(), token, VerifyGatewayAttestationOptions{
+		Policy: policy, NonceHex: fixture.nonce, TLSCertDER: fixture.certDER, JWKS: fixture.jwks,
+	}); err != nil {
+		t.Fatalf("VerifyGatewayAttestation returned error: %v", err)
 	}
 }
 
@@ -446,6 +485,10 @@ func (f attestationFixture) claims(overrides map[string]any) map[string]any {
 		"iss":              GCPIssuer,
 		"aud":              defaultAttestationAudience,
 		"exp":              time.Now().Add(time.Hour).Unix(),
+		"dbgstat":          "disabled-since-boot",
+		"swname":           "CONFIDENTIAL_SPACE",
+		"secboot":          true,
+		"hwmodel":          "GCP_AMD_SEV",
 		"eat_nonce":        []string{f.nonce},
 		"tls_cert_sha256":  f.certSHA,
 		"submods":          map[string]any{"container": map[string]any{"image_digest": f.imageDigest, "image_reference": f.imageReference}},

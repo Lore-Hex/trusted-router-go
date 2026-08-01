@@ -26,11 +26,46 @@ const AutoModel = "trustedrouter/auto"
 // FastModel is the low-latency TrustedRouter model selector.
 const FastModel = "trustedrouter/fast"
 
+// ZDRModel routes only through zero-data-retention providers.
+const ZDRModel = "trustedrouter/zdr"
+
+// E2EModel routes only through provider-side confidential compute and E2EE.
+const E2EModel = "trustedrouter/e2e"
+
+// ConfidentialModel is an alias for E2EModel.
+const ConfidentialModel = "trustedrouter/confidential"
+
+// EUModel routes through EU-focused providers.
+const EUModel = "trustedrouter/eu"
+
+// USModel routes through US-jurisdiction providers.
+const USModel = "trustedrouter/us"
+
 // FusionModel is the TrustedRouter Fusion orchestration model.
 const FusionModel = "trustedrouter/fusion"
 
+// SynthModel is the preferred Synth orchestration alias.
+const SynthModel = "trustedrouter/synth"
+
 // AdvisorModel is the TrustedRouter Advisor orchestration model.
 const AdvisorModel = "trustedrouter/advisor"
+
+// SelectorModel is the Selector orchestration primitive.
+const SelectorModel = "trustedrouter/selector"
+
+// MapReduceModel is the MapReduce orchestration primitive.
+const MapReduceModel = "trustedrouter/mapreduce"
+
+// SubagentModel is the Subagent orchestration primitive.
+const SubagentModel = "trustedrouter/subagent"
+
+// Stable named orchestration aliases.
+const (
+	SocratesModel   = "trustedrouter/socrates-1.1"
+	PrometheusModel = "trustedrouter/prometheus-2.0"
+	ZeusModel       = "trustedrouter/zeus-1.0"
+	AthenaModel     = "trustedrouter/athena"
+)
 
 // FusionFreedomPanel is the recommended Fusion panel for maximum willingness to answer.
 var FusionFreedomPanel = []string{

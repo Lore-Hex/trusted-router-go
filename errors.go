@@ -15,6 +15,14 @@ type Error struct {
 	Message string
 	// Payload is the parsed error payload when the gateway returned JSON.
 	Payload any
+	// Layer identifies whether routing, gateway, billing, or provider code failed.
+	Layer string
+	// Source is the actionable error source supplied by the API.
+	Source string
+	// Provider identifies the attempted provider when supplied.
+	Provider string
+	// RequestID correlates the error with TrustedRouter metadata logs.
+	RequestID string
 }
 
 // Error returns the TrustedRouter error message.
@@ -125,6 +133,10 @@ func classifyError(status int, message string, payload any, headers http.Header)
 		message = "TrustedRouter error"
 	}
 	base := &Error{StatusCode: status, Message: message, Payload: payload}
+	base.Layer = errorString(payload, "layer")
+	base.Source = errorString(payload, "source")
+	base.Provider = errorString(payload, "provider")
+	base.RequestID = errorString(payload, "request_id")
 	switch {
 	case status == http.StatusUnauthorized:
 		return &AuthenticationError{embeddedError: base}
@@ -143,6 +155,19 @@ func classifyError(status int, message string, payload any, headers http.Header)
 	default:
 		return base
 	}
+}
+
+func errorString(payload any, key string) string {
+	root, ok := payload.(map[string]any)
+	if !ok {
+		return ""
+	}
+	detail := root
+	if nested, ok := root["error"].(map[string]any); ok {
+		detail = nested
+	}
+	value, _ := detail[key].(string)
+	return value
 }
 
 func transportRetryError(err error) error {

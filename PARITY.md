@@ -57,6 +57,10 @@ absolute metadata URLs rather than either `/v1` plane.
 | `AdvisorToolOptions` | `AdvisorToolOptions` | Field names are Go idiomatic. |
 | `AdvisorTool` | `map[string]any` from `AdvisorTool` | Go returns the JSON tool spec directly. |
 | `advisorTool` | `AdvisorTool` | Same JSON shape. |
+| `selectorTool` | `SelectorTool` | Same JSON shape. |
+| `mapReduceTool` | `MapReduceTool` | Same JSON shape. |
+| `subagentTool` | `SubagentTool` | Same JSON shape. |
+| `ProviderPreferences` | `ProviderPreferences` | Hard ZDR, confidential, US, provider allow/deny/order, billing-source, quantization, fallback, and sort controls. EU routing uses `EUModel`. |
 | `TrustedRouterError` | `Error` | Base typed SDK error. |
 | `BadRequestError` | `BadRequestError` | Same HTTP class. |
 | `AuthenticationError` | `AuthenticationError` | Same HTTP class. |
@@ -166,6 +170,10 @@ absolute metadata URLs rather than either `/v1` plane.
 | `region_base_url` | N/A | Per-region API hostnames were removed. |
 | `fusion_tool` | `FusionTool` | Same JSON shape. |
 | `advisor_tool` | `AdvisorTool` | Same JSON shape. |
+| `selector_tool` | `SelectorTool` | Same JSON shape. |
+| `map_reduce_tool` | `MapReduceTool` | Same JSON shape. |
+| `subagent_tool` | `SubagentTool` | Same JSON shape. |
+| `ProviderPreferences` | `ProviderPreferences` | Same hard routing and privacy constraints. |
 | `TrustedRouterError` | `Error` | Base SDK error. |
 | `BadRequestError` | `BadRequestError` | Same HTTP class. |
 | `AuthenticationError` | `AuthenticationError` | Same HTTP class. |

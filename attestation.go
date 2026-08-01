@@ -66,6 +66,8 @@ type AttestationPolicy struct {
 	ExpectedImageDigest string `json:"expected_image_digest,omitempty"`
 	// ExpectedImageReference pins the workload container image reference.
 	ExpectedImageReference string `json:"expected_image_reference,omitempty"`
+	// AllowDebug permits a debug Confidential Space image for local development only.
+	AllowDebug bool `json:"allow_debug,omitempty"`
 }
 
 // GatewayAttestation is a verified gateway attestation result.
@@ -494,13 +496,33 @@ func jwksKeys(jwks map[string]any) ([]map[string]any, bool) {
 func checkAttestationClaims(claims map[string]any, policy AttestationPolicy, nonceHex string, tlsCertDER []byte, tlsExporter []byte) (*GatewayAttestation, error) {
 	now := time.Now().Unix()
 	expValue, expOK := intClaim(claims["exp"])
-	if expOK && expValue <= now {
+	if !expOK {
+		return nil, attestationErr("JWT is missing a valid expiration", nil)
+	}
+	if expValue <= now {
 		return nil, attestationErr(fmt.Sprintf("JWT expired at %d (now=%d)", expValue, now), nil)
 	}
 
 	iss, _ := claims["iss"].(string)
 	if iss != GCPIssuer {
 		return nil, attestationErr(fmt.Sprintf("unexpected issuer %s; expected %s", pyRepr(claims["iss"]), GCPIssuer), nil)
+	}
+
+	debugStatus, _ := claims["dbgstat"].(string)
+	if !policy.AllowDebug && !strings.EqualFold(debugStatus, "disabled-since-boot") {
+		return nil, attestationErr("debug Confidential Space workload must report disabled-since-boot", nil)
+	}
+	softwareName, _ := claims["swname"].(string)
+	if softwareName != "CONFIDENTIAL_SPACE" {
+		return nil, attestationErr("attested workload is not running Confidential Space", nil)
+	}
+	secureBoot, _ := claims["secboot"].(bool)
+	if !secureBoot {
+		return nil, attestationErr("attested workload does not report Secure Boot", nil)
+	}
+	hardware, _ := claims["hwmodel"].(string)
+	if hardware != "GCP_AMD_SEV" && hardware != "GCP_AMD_SEV_ES" && hardware != "GCP_INTEL_TDX" {
+		return nil, attestationErr(fmt.Sprintf("unsupported confidential hardware model %s", pyRepr(hardware)), nil)
 	}
 
 	audience := policy.GCPAudience
