@@ -64,8 +64,12 @@ type AttestationPolicy struct {
 	ExpectedCertSHA256 string `json:"expected_cert_sha256,omitempty"`
 	// ExpectedImageDigest pins the workload container image digest.
 	ExpectedImageDigest string `json:"expected_image_digest,omitempty"`
+	// ExpectedImageDigests permits a published transition set during staged rollouts.
+	ExpectedImageDigests []string `json:"expected_image_digests,omitempty"`
 	// ExpectedImageReference pins the workload container image reference.
 	ExpectedImageReference string `json:"expected_image_reference,omitempty"`
+	// ExpectedImageReferences permits published image tags during staged rollouts.
+	ExpectedImageReferences []string `json:"expected_image_references,omitempty"`
 	// AllowDebug permits a debug Confidential Space image for local development only.
 	AllowDebug bool `json:"allow_debug,omitempty"`
 }
@@ -143,18 +147,20 @@ func (p *TrustReleaseDataPolicy) UnmarshalJSON(data []byte) error {
 
 // TrustRelease is the parsed public TrustedRouter trust-release document.
 type TrustRelease struct {
-	Platform            string                  `json:"platform,omitempty"`
-	SourceRepo          string                  `json:"source_repo,omitempty"`
-	SourceRepositories  map[string]string       `json:"source_repositories,omitempty"`
-	SourceCommit        string                  `json:"source_commit,omitempty"`
-	ImageReference      string                  `json:"image_reference,omitempty"`
-	ImageDigest         string                  `json:"image_digest,omitempty"`
-	AttestationIssuer   string                  `json:"attestation_issuer,omitempty"`
-	AttestationAudience string                  `json:"attestation_audience,omitempty"`
-	APIBaseURL          string                  `json:"api_base_url,omitempty"`
-	TLS                 *TrustReleaseTLS        `json:"tls,omitempty"`
-	DataPolicy          *TrustReleaseDataPolicy `json:"data_policy,omitempty"`
-	Extra               map[string]any          `json:"-"`
+	Platform                string                  `json:"platform,omitempty"`
+	SourceRepo              string                  `json:"source_repo,omitempty"`
+	SourceRepositories      map[string]string       `json:"source_repositories,omitempty"`
+	SourceCommit            string                  `json:"source_commit,omitempty"`
+	ImageReference          string                  `json:"image_reference,omitempty"`
+	AcceptedImageReferences []string                `json:"accepted_image_references,omitempty"`
+	ImageDigest             string                  `json:"image_digest,omitempty"`
+	AcceptedImageDigests    []string                `json:"accepted_image_digests,omitempty"`
+	AttestationIssuer       string                  `json:"attestation_issuer,omitempty"`
+	AttestationAudience     string                  `json:"attestation_audience,omitempty"`
+	APIBaseURL              string                  `json:"api_base_url,omitempty"`
+	TLS                     *TrustReleaseTLS        `json:"tls,omitempty"`
+	DataPolicy              *TrustReleaseDataPolicy `json:"data_policy,omitempty"`
+	Extra                   map[string]any          `json:"-"`
 }
 
 // UnmarshalJSON decodes a trust release and preserves unknown fields in Extra.
@@ -165,7 +171,7 @@ func (t *TrustRelease) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	*t = TrustRelease(out)
-	t.Extra = extraFields(data, "platform", "source_repo", "source_repositories", "source_commit", "image_reference", "image_digest", "attestation_issuer", "attestation_audience", "api_base_url", "tls", "data_policy")
+	t.Extra = extraFields(data, "platform", "source_repo", "source_repositories", "source_commit", "image_reference", "accepted_image_references", "image_digest", "accepted_image_digests", "attestation_issuer", "attestation_audience", "api_base_url", "tls", "data_policy")
 	return nil
 }
 
@@ -197,11 +203,21 @@ func PolicyFromTrustRelease(ctx context.Context, opts PolicyFromTrustReleaseOpti
 	if audience == "" {
 		audience = defaultAttestationAudience
 	}
+	acceptedImageDigests := append([]string(nil), release.AcceptedImageDigests...)
+	if len(acceptedImageDigests) == 0 && release.ImageDigest != "" {
+		acceptedImageDigests = []string{release.ImageDigest}
+	}
+	acceptedImageReferences := append([]string(nil), release.AcceptedImageReferences...)
+	if len(acceptedImageReferences) == 0 && release.ImageReference != "" {
+		acceptedImageReferences = []string{release.ImageReference}
+	}
 	return AttestationPolicy{
-		GCPAudience:            audience,
-		ExpectedCertSHA256:     opts.CertSHA256,
-		ExpectedImageDigest:    release.ImageDigest,
-		ExpectedImageReference: release.ImageReference,
+		GCPAudience:             audience,
+		ExpectedCertSHA256:      opts.CertSHA256,
+		ExpectedImageDigest:     release.ImageDigest,
+		ExpectedImageDigests:    acceptedImageDigests,
+		ExpectedImageReference:  release.ImageReference,
+		ExpectedImageReferences: acceptedImageReferences,
 	}, nil
 }
 
@@ -539,11 +555,27 @@ func checkAttestationClaims(claims map[string]any, policy AttestationPolicy, non
 	imageDigest, _ := container["image_digest"].(string)
 	imageReference, _ := container["image_reference"].(string)
 
-	if policy.ExpectedImageDigest != "" && !safeEq(imageDigest, policy.ExpectedImageDigest) {
-		return nil, attestationErr(fmt.Sprintf("image_digest mismatch: workload=%s, policy=%s", pyRepr(imageDigest), pyRepr(policy.ExpectedImageDigest)), nil)
+	acceptedImageDigests := policy.ExpectedImageDigests
+	if len(acceptedImageDigests) == 0 && policy.ExpectedImageDigest != "" {
+		acceptedImageDigests = []string{policy.ExpectedImageDigest}
 	}
-	if policy.ExpectedImageReference != "" && !safeEq(imageReference, policy.ExpectedImageReference) {
-		return nil, attestationErr(fmt.Sprintf("image_reference mismatch: workload=%s, policy=%s", pyRepr(imageReference), pyRepr(policy.ExpectedImageReference)), nil)
+	if len(acceptedImageDigests) > 0 && !containsSafeString(acceptedImageDigests, imageDigest) {
+		policyDisplay := pyRepr(acceptedImageDigests)
+		if len(acceptedImageDigests) == 1 {
+			policyDisplay = pyRepr(acceptedImageDigests[0])
+		}
+		return nil, attestationErr(fmt.Sprintf("image_digest mismatch: workload=%s, policy=%s", pyRepr(imageDigest), policyDisplay), nil)
+	}
+	acceptedImageReferences := policy.ExpectedImageReferences
+	if len(acceptedImageReferences) == 0 && policy.ExpectedImageReference != "" {
+		acceptedImageReferences = []string{policy.ExpectedImageReference}
+	}
+	if len(acceptedImageReferences) > 0 && !containsSafeString(acceptedImageReferences, imageReference) {
+		policyDisplay := pyRepr(acceptedImageReferences)
+		if len(acceptedImageReferences) == 1 {
+			policyDisplay = pyRepr(acceptedImageReferences[0])
+		}
+		return nil, attestationErr(fmt.Sprintf("image_reference mismatch: workload=%s, policy=%s", pyRepr(imageReference), policyDisplay), nil)
 	}
 
 	nonces := nonceList(claims)
@@ -706,6 +738,15 @@ func sha256Hex(data []byte) string {
 
 func safeEq(a, b string) bool {
 	return hmac.Equal([]byte(a), []byte(b))
+}
+
+func containsSafeString(values []string, target string) bool {
+	for _, value := range values {
+		if safeEq(value, target) {
+			return true
+		}
+	}
+	return false
 }
 
 func containsString(values []string, target string) bool {

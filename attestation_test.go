@@ -12,6 +12,7 @@ import (
 	"io"
 	"math/big"
 	"net/http"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -278,6 +279,29 @@ func TestVerifyGatewayAttestationAllowsDebugOnlyWhenExplicit(t *testing.T) {
 	}
 }
 
+func TestVerifyGatewayAttestationAcceptsPublishedRolloutDigest(t *testing.T) {
+	fixture := newAttestationFixture(t)
+	policy := fixture.policy
+	policy.ExpectedImageDigest = "sha256:new"
+	policy.ExpectedImageDigests = []string{fixture.imageDigest, "sha256:new"}
+	policy.ExpectedImageReference = "registry.example/new:release"
+	policy.ExpectedImageReferences = []string{
+		fixture.imageReference,
+		"registry.example/new:release",
+	}
+	token := fixture.mint(t, fixture.claims(nil))
+
+	verified, err := VerifyGatewayAttestation(context.Background(), token, VerifyGatewayAttestationOptions{
+		Policy: policy, NonceHex: fixture.nonce, TLSCertDER: fixture.certDER, JWKS: fixture.jwks,
+	})
+	if err != nil {
+		t.Fatalf("VerifyGatewayAttestation returned error: %v", err)
+	}
+	if verified.ImageDigest != fixture.imageDigest {
+		t.Fatalf("ImageDigest = %q, want %q", verified.ImageDigest, fixture.imageDigest)
+	}
+}
+
 func TestVerifyGatewayAttestationShapeRejections(t *testing.T) {
 	fixture := newAttestationFixture(t)
 
@@ -336,7 +360,9 @@ func TestFetchTrustReleaseAndPolicyFromTrustRelease(t *testing.T) {
 		return attestationTestResponse(http.StatusOK, `{
 			"platform": "gcp-confidential-space",
 			"image_digest": "sha256:release",
+			"accepted_image_digests": ["sha256:previous", "sha256:release"],
 			"image_reference": "us-docker.pkg.dev/project/gateway:prod",
+			"accepted_image_references": ["us-docker.pkg.dev/project/gateway:old", "us-docker.pkg.dev/project/gateway:prod"],
 			"attestation_issuer": "https://confidentialcomputing.googleapis.com",
 			"attestation_audience": "quill-cloud",
 			"tls": {"mode": "managed", "hostname": "api.trustedrouter.com"},
@@ -354,6 +380,12 @@ func TestFetchTrustReleaseAndPolicyFromTrustRelease(t *testing.T) {
 	}
 	if release.ImageDigest != "sha256:release" {
 		t.Fatalf("ImageDigest = %q", release.ImageDigest)
+	}
+	if !reflect.DeepEqual(release.AcceptedImageDigests, []string{"sha256:previous", "sha256:release"}) {
+		t.Fatalf("AcceptedImageDigests = %#v", release.AcceptedImageDigests)
+	}
+	if !reflect.DeepEqual(release.AcceptedImageReferences, []string{"us-docker.pkg.dev/project/gateway:old", "us-docker.pkg.dev/project/gateway:prod"}) {
+		t.Fatalf("AcceptedImageReferences = %#v", release.AcceptedImageReferences)
 	}
 	if release.TLS == nil || release.TLS.Hostname != "api.trustedrouter.com" {
 		t.Fatalf("TLS = %#v", release.TLS)
@@ -373,7 +405,9 @@ func TestFetchTrustReleaseAndPolicyFromTrustRelease(t *testing.T) {
 	if policy.GCPAudience != "custom-audience" ||
 		policy.ExpectedCertSHA256 != "abc" ||
 		policy.ExpectedImageDigest != release.ImageDigest ||
-		policy.ExpectedImageReference != release.ImageReference {
+		!reflect.DeepEqual(policy.ExpectedImageDigests, release.AcceptedImageDigests) ||
+		policy.ExpectedImageReference != release.ImageReference ||
+		!reflect.DeepEqual(policy.ExpectedImageReferences, release.AcceptedImageReferences) {
 		t.Fatalf("policy = %#v", policy)
 	}
 
