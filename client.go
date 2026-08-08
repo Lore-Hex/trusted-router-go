@@ -129,7 +129,7 @@ func NewClient(opts Options) (*Client, error) {
 		workspaceID:      opts.WorkspaceID,
 		maxRetries:       maxRetries,
 		regionalFailover: failoverEnabled,
-		baseURLs:         []string{baseURL},
+		baseURLs:         inferenceBaseURLs(baseURL),
 	}, nil
 }
 
@@ -217,7 +217,10 @@ func (c *Client) rawRequestWithBaseURLs(ctx context.Context, method, path string
 	}
 
 	attempt := 0
-	baseURL := baseURLs[0]
+	// baseIndex, not a pinned baseURL. This was `baseURL := baseURLs[0]` set
+	// once outside the loop and never reassigned, so every retry re-hit the
+	// same host — failover could not move even when candidates existed.
+	baseIndex := 0
 	timeout, hasTimeout := c.effectiveTimeout(opts)
 	for {
 		if err := ctx.Err(); err != nil {
@@ -226,7 +229,7 @@ func (c *Client) rawRequestWithBaseURLs(ctx context.Context, method, path string
 
 		attemptCtx, cancel := contextWithOptionalTimeout(ctx, timeout, hasTimeout)
 
-		req, err := c.newHTTPRequest(attemptCtx, method, joinURL(baseURL, path), bodyBytes, hasBody, opts)
+		req, err := c.newHTTPRequest(attemptCtx, method, joinURL(baseURLs[baseIndex], path), bodyBytes, hasBody, opts)
 		if err != nil {
 			cancel()
 			return nil, err
@@ -243,6 +246,11 @@ func (c *Client) rawRequestWithBaseURLs(ctx context.Context, method, path string
 				return nil, transportRetryError(err)
 			}
 			cancel()
+			// A dial/transport failure means no server saw the request, so
+			// moving to another domain cannot double-execute anything.
+			if baseIndex < len(baseURLs)-1 {
+				baseIndex++
+			}
 			if sleepErr := sleepForRetry(ctx, attempt, nil); sleepErr != nil {
 				return nil, sleepErr
 			}
@@ -259,6 +267,12 @@ func (c *Client) rawRequestWithBaseURLs(ctx context.Context, method, path string
 		retryAfter := retryAfterSeconds(resp.Header)
 		drainAndClose(resp.Body)
 		cancel()
+		// Only the gateway-level statuses. A 500 means a server received and
+		// processed the request, and inference is not idempotent, so retrying
+		// it on another domain risks charging twice.
+		if regionalFailover && regionalFailoverable(resp.StatusCode) && baseIndex < len(baseURLs)-1 {
+			baseIndex++
+		}
 		if sleepErr := sleepForRetry(ctx, attempt, retryAfter); sleepErr != nil {
 			return nil, sleepErr
 		}
@@ -531,4 +545,25 @@ func truncateString(value string, limit int) string {
 		return value
 	}
 	return value[:limit]
+}
+
+// inferenceBaseURLs returns the primary followed by the alias domains.
+//
+// The list must have MORE THAN ONE entry or failover cannot engage: every
+// advance is guarded by `baseIndex < len(baseURLs)-1`.
+//
+// Aliases are added ONLY for the default host. A caller who passed their own
+// base URL — a private deployment, a test server, a regional pin — gets exactly
+// that; silently redirecting their traffic to a public alias would be worse
+// than failing.
+func inferenceBaseURLs(primary string) []string {
+	trimmed := strings.TrimRight(primary, "/")
+	if trimmed != strings.TrimRight(DefaultAPIBaseURL, "/") {
+		return []string{primary}
+	}
+	out := []string{trimmed}
+	for _, alias := range AliasAPIBaseURLs {
+		out = append(out, strings.TrimRight(alias, "/"))
+	}
+	return out
 }

@@ -5,6 +5,18 @@ import "time"
 // DefaultAPIBaseURL is the default OpenAI-compatible TrustedRouter inference base URL.
 const DefaultAPIBaseURL = "https://api.trustedrouter.com/v1"
 
+// AliasAPIBaseURLs are exact aliases of DefaultAPIBaseURL, on separate domains
+// served by separate DNS providers (trustedrouter.com from Google Cloud DNS,
+// these two from Route 53). They resolve to the same attested enclaves.
+//
+// The domain is a single point of failure sitting above the whole deployment:
+// a zone that stops answering, a registrar lock, or a resolver handing out a
+// stale record takes the API down however many clouds are behind it.
+var AliasAPIBaseURLs = []string{
+	"https://api.allyrouter.com/v1",
+	"https://api.uptimerouter.com/v1",
+}
+
 // DefaultControlBaseURL is the default TrustedRouter control-plane base URL.
 const DefaultControlBaseURL = "https://trustedrouter.com/v1"
 
