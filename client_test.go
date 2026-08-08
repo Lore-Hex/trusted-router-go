@@ -27,7 +27,9 @@ func TestClientConstruction(t *testing.T) {
 	if client.ControlBaseURL() != DefaultControlBaseURL {
 		t.Fatalf("control base url = %q", client.ControlBaseURL())
 	}
-	if got := client.BaseURLs(); strings.Join(got, ",") != DefaultAPIBaseURL {
+	// Primary first, then the alias domains. A single-entry list would make
+	// every failover branch unreachable, which is what it used to be.
+	if got := client.BaseURLs(); got[0] != DefaultAPIBaseURL || len(got) < 2 {
 		t.Fatalf("base urls = %#v", got)
 	}
 
@@ -710,7 +712,11 @@ func TestRequestRetryAndErrorBehavior(t *testing.T) {
 	})
 }
 
-func TestTransportExhaustionRetriesApex(t *testing.T) {
+// Renamed from TestTransportExhaustionRetriesApex. It asserted all three
+// attempts re-hit the apex, which is what a one-entry candidate list forced —
+// the name documented a no-op as the intended behaviour. A dial failure means
+// no server saw the request, so exhausting the candidates is the correct walk.
+func TestTransportExhaustionWalksAllCandidates(t *testing.T) {
 	restore := stubSleep(func(context.Context, time.Duration) error { return nil })
 	defer restore()
 
@@ -735,7 +741,7 @@ func TestTransportExhaustionRetriesApex(t *testing.T) {
 	if !strings.HasPrefix(internal.Message, "TrustedRouter endpoint unavailable: ") || !strings.Contains(internal.Message, "dial failed") {
 		t.Fatalf("message = %q", internal.Message)
 	}
-	wantHosts := "api.trustedrouter.com,api.trustedrouter.com,api.trustedrouter.com"
+	wantHosts := "api.trustedrouter.com,api.allyrouter.com,api.uptimerouter.com"
 	if strings.Join(seenHosts, ",") != wantHosts {
 		t.Fatalf("hosts = %#v", seenHosts)
 	}
