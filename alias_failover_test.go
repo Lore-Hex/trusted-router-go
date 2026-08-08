@@ -38,18 +38,6 @@ func TestACustomBaseURLIsNeverRedirectedToAPublicAlias(t *testing.T) {
 	}
 }
 
-// hostRecorder stands in for the alias fleet: the primary always fails the way
-// the test asks, and any other host succeeds.
-func hostRecorder(t *testing.T, seen *[]string, primaryStatus int) *httptest.Server {
-	t.Helper()
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		*seen = append(*seen, r.Host)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(primaryStatus)
-		_, _ = w.Write([]byte(`{"ok":true}`))
-	}))
-}
-
 func TestA503AdvancesToTheNextCandidate(t *testing.T) {
 	var seen []string
 	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
