@@ -880,7 +880,7 @@ func (c *Client) openEventStream(ctx context.Context, method, path string, body 
 			continue
 		}
 		if resp.StatusCode >= 400 {
-			if attempt < c.maxRetries && c.regionalFailover && regionalFailoverable(resp.StatusCode) {
+			if attempt < c.maxRetries && c.regionalFailover && regionalFailoverable(resp.StatusCode, resp.Header) {
 				retryAfter := retryAfterSeconds(resp.Header)
 				drainAndClose(resp.Body)
 				cancelAttempt(nil)

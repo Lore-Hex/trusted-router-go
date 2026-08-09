@@ -241,14 +241,16 @@ func (c *Client) rawRequestWithBaseURLs(ctx context.Context, method, path string
 				cancel()
 				return nil, ctxErr
 			}
-			if attempt >= c.maxRetries || !regionalFailover {
+			if attempt >= c.maxRetries {
 				cancel()
 				return nil, transportRetryError(err)
 			}
 			cancel()
 			// A dial/transport failure means no server saw the request, so
 			// moving to another domain cannot double-execute anything.
-			if baseIndex < len(baseURLs)-1 {
+			// RegionalFailover governs only that move; a pinned client still
+			// retries, it just stays on the host the caller named.
+			if regionalFailover && baseIndex < len(baseURLs)-1 {
 				baseIndex++
 			}
 			if sleepErr := sleepForRetry(ctx, attempt, nil); sleepErr != nil {
@@ -258,7 +260,7 @@ func (c *Client) rawRequestWithBaseURLs(ctx context.Context, method, path string
 			continue
 		}
 
-		if attempt >= c.maxRetries || !retryable(resp.StatusCode, regionalFailover) {
+		if attempt >= c.maxRetries || !retryable(resp.StatusCode, resp.Header) {
 			if hasTimeout {
 				resp.Body = cancelOnCloseReadCloser{ReadCloser: resp.Body, cancel: cancel}
 			}
@@ -270,7 +272,7 @@ func (c *Client) rawRequestWithBaseURLs(ctx context.Context, method, path string
 		// Only the gateway-level statuses. A 500 means a server received and
 		// processed the request, and inference is not idempotent, so retrying
 		// it on another domain risks charging twice.
-		if regionalFailover && regionalFailoverable(resp.StatusCode) && baseIndex < len(baseURLs)-1 {
+		if regionalFailover && regionalFailoverable(resp.StatusCode, resp.Header) && baseIndex < len(baseURLs)-1 {
 			baseIndex++
 		}
 		if sleepErr := sleepForRetry(ctx, attempt, retryAfter); sleepErr != nil {
