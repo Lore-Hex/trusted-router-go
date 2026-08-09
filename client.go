@@ -271,7 +271,8 @@ func (c *Client) rawRequestWithBaseURLs(ctx context.Context, method, path string
 		cancel()
 		// Only the gateway-level statuses. A 500 means a server received and
 		// processed the request, and inference is not idempotent, so retrying
-		// it on another domain risks charging twice.
+		// it on another domain would run the work again: not a double charge
+		// to the caller, but a second upstream generation we pay for.
 		if regionalFailover && regionalFailoverable(resp.StatusCode, resp.Header) && baseIndex < len(baseURLs)-1 {
 			baseIndex++
 		}
