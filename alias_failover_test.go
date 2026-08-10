@@ -76,7 +76,9 @@ func TestA503AdvancesToTheNextCandidate(t *testing.T) {
 
 func TestA500DoesNotAdvanceToAnotherDomain(t *testing.T) {
 	// A 500 means a server received and processed the request. Inference is not
-	// idempotent, so moving it to another domain risks charging twice.
+	// idempotent. The caller is not charged twice (authorization is idempotent
+	// per Idempotency-Key, settlement is exactly-once) but the work would run
+	// again, costing TrustedRouter a second upstream generation.
 	var seen []string
 	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seen = append(seen, "primary")

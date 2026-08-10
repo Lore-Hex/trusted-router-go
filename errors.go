@@ -177,7 +177,40 @@ func transportRetryError(err error) error {
 	}}
 }
 
+// shouldRetryVerdict reads the gateway's explicit x-should-retry instruction,
+// which overrides every heuristic below it.
+//
+// A status code cannot say whether a provider already ran. A 502 from "could
+// not reach the provider" and a 502 from "the generation succeeded and then
+// settlement failed" are indistinguishable here, and only the second is
+// dangerous to re-send. The gateway knows and now says so. Same header
+// OpenAI's clients honour.
+//
+// Returns nil when the server did not say, which leaves existing behaviour
+// untouched for older gateways and for paths deliberately left unlabelled.
+func shouldRetryVerdict(headers http.Header) *bool {
+	raw := strings.ToLower(strings.TrimSpace(headers.Get("X-Should-Retry")))
+	switch raw {
+	case "true":
+		yes := true
+		return &yes
+	case "false":
+		no := false
+		return &no
+	default:
+		return nil
+	}
+}
+
 func retryAfterSeconds(headers http.Header) *float64 {
+	// retry-after-ms wins when both are present: it is the more precise of the
+	// two, and a server that sends it means the sub-second value.
+	if rawMS := strings.TrimSpace(headers.Get("Retry-After-Ms")); rawMS != "" {
+		if millis, err := strconv.ParseFloat(rawMS, 64); err == nil && millis >= 0 {
+			seconds := millis / 1000
+			return &seconds
+		}
+	}
 	raw := headers.Get("Retry-After")
 	if raw == "" {
 		return nil
@@ -193,16 +226,25 @@ func retryAfterSeconds(headers http.Header) *float64 {
 	return &parsed
 }
 
-func retryable(status int, regionalFailover bool) bool {
-	if status == http.StatusTooManyRequests {
-		return true
+// retryable answers "may we send this again", independent of WHERE. It used to
+// take regionalFailover and return it for 502/503/504, which conflated two
+// separate questions: pinning to one host also silently stopped retrying the
+// gateway statuses entirely. Now the flag governs only the destination.
+func retryable(status int, headers http.Header) bool {
+	if verdict := shouldRetryVerdict(headers); verdict != nil {
+		return *verdict
 	}
-	if regionalFailoverable(status) {
-		return regionalFailover
-	}
-	return status >= 500
+	return status == http.StatusTooManyRequests || status >= 500
 }
 
-func regionalFailoverable(status int) bool {
+// regionalFailoverable answers "may this move to a DIFFERENT domain".
+//
+// An explicit x-should-retry: false forbids it outright — that is the gateway
+// telling us a provider already ran, which is exactly when re-sending anywhere
+// costs a second generation.
+func regionalFailoverable(status int, headers http.Header) bool {
+	if verdict := shouldRetryVerdict(headers); verdict != nil && !*verdict {
+		return false
+	}
 	return status == http.StatusBadGateway || status == http.StatusServiceUnavailable || status == http.StatusGatewayTimeout
 }
