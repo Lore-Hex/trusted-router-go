@@ -783,7 +783,10 @@ func TestRegionalFailoverAndChatIdempotency(t *testing.T) {
 	if strings.Join(tokens, "") != "OK" {
 		t.Fatalf("tokens = %#v", tokens)
 	}
-	if strings.Join(seenHosts, ",") != "api.trustedrouter.com,api.trustedrouter.com" {
+	// Strengthened with the transport unification: a failoverable 503 on a
+	// stream open now advances to the alias domain (primary-then-alias), the
+	// same walk the buffered path takes.
+	if strings.Join(seenHosts, ",") != "api.trustedrouter.com,api.allyrouter.com" {
 		t.Fatalf("hosts = %#v", seenHosts)
 	}
 	if len(seenKeys) != 2 || seenKeys[0] == "" || seenKeys[0] != seenKeys[1] || !strings.HasPrefix(seenKeys[0], "tr-req-") {
