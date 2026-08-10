@@ -1,10 +1,17 @@
 package trustedrouter
 
+// errors.go is the ERROR TAXONOMY (L6): the typed error hierarchy,
+// status→error classification, response decode/raise helpers, and attribution
+// fields with the raw payload preserved. Retry/failover DECISIONS live in
+// retry_policy.go (L1); this file only names what went wrong.
+
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
-	"strconv"
-	"strings"
 )
 
 // Error is the base error type returned by the TrustedRouter SDK.
@@ -177,74 +184,108 @@ func transportRetryError(err error) error {
 	}}
 }
 
-// shouldRetryVerdict reads the gateway's explicit x-should-retry instruction,
-// which overrides every heuristic below it.
-//
-// A status code cannot say whether a provider already ran. A 502 from "could
-// not reach the provider" and a 502 from "the generation succeeded and then
-// settlement failed" are indistinguishable here, and only the second is
-// dangerous to re-send. The gateway knows and now says so. Same header
-// OpenAI's clients honour.
-//
-// Returns nil when the server did not say, which leaves existing behaviour
-// untouched for older gateways and for paths deliberately left unlabelled.
-func shouldRetryVerdict(headers http.Header) *bool {
-	raw := strings.ToLower(strings.TrimSpace(headers.Get("X-Should-Retry")))
-	switch raw {
-	case "true":
-		yes := true
-		return &yes
-	case "false":
-		no := false
-		return &no
-	default:
+func decodeResponse(ctx context.Context, resp *http.Response, out any) error {
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return transportRetryError(err)
+		}
+		return err
+	}
+	if resp.StatusCode >= 400 {
+		payload, ok := parseJSONPayload(body)
+		if !ok {
+			return classifyError(resp.StatusCode, truncateString(string(body), 240), nil, resp.Header)
+		}
+		return classifyError(resp.StatusCode, errorMessage(payload), payload, resp.Header)
+	}
+	if out == nil {
 		return nil
 	}
+	if len(body) == 0 {
+		return io.ErrUnexpectedEOF
+	}
+	return json.Unmarshal(body, out)
 }
 
-func retryAfterSeconds(headers http.Header) *float64 {
-	// retry-after-ms wins when both are present: it is the more precise of the
-	// two, and a server that sends it means the sub-second value.
-	if rawMS := strings.TrimSpace(headers.Get("Retry-After-Ms")); rawMS != "" {
-		if millis, err := strconv.ParseFloat(rawMS, 64); err == nil && millis >= 0 {
-			seconds := millis / 1000
-			return &seconds
+func parseJSONPayload(body []byte) (any, bool) {
+	if len(body) == 0 {
+		return nil, false
+	}
+	var payload any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, false
+	}
+	return payload, true
+}
+
+func errorMessage(payload any) string {
+	obj, ok := payload.(map[string]any)
+	if !ok {
+		return "TrustedRouter error"
+	}
+	errRaw, hasError := obj["error"]
+	if hasError {
+		errValue, ok := errRaw.(map[string]any)
+		if ok {
+			if message, ok := errValue["message"]; ok && truthy(message) {
+				return fmt.Sprint(message)
+			}
+			if typ, ok := errValue["type"]; ok && truthy(typ) {
+				return fmt.Sprint(typ)
+			}
+			return "TrustedRouter error"
 		}
 	}
-	raw := headers.Get("Retry-After")
-	if raw == "" {
-		return nil
+	if message, ok := obj["message"]; ok && truthy(message) {
+		return fmt.Sprint(message)
 	}
-	parsed, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
-	if err != nil {
-		// Python intentionally ignores HTTP-date Retry-After values; keep Go identical.
-		return nil
-	}
-	if parsed < 0 {
-		parsed = 0
-	}
-	return &parsed
+	return "TrustedRouter error"
 }
 
-// retryable answers "may we send this again", independent of WHERE. It used to
-// take regionalFailover and return it for 502/503/504, which conflated two
-// separate questions: pinning to one host also silently stopped retrying the
-// gateway statuses entirely. Now the flag governs only the destination.
-func retryable(status int, headers http.Header) bool {
-	if verdict := shouldRetryVerdict(headers); verdict != nil {
-		return *verdict
-	}
-	return status == http.StatusTooManyRequests || status >= 500
-}
-
-// regionalFailoverable answers "may this move to a DIFFERENT domain".
-//
-// An explicit x-should-retry: false forbids it outright — that is the gateway
-// telling us a provider already ran, which is exactly when re-sending anywhere
-// costs a second generation.
-func regionalFailoverable(status int, headers http.Header) bool {
-	if verdict := shouldRetryVerdict(headers); verdict != nil && !*verdict {
+func truthy(value any) bool {
+	switch v := value.(type) {
+	case nil:
 		return false
+	case bool:
+		return v
+	case string:
+		return v != ""
+	case int:
+		return v != 0
+	case int8:
+		return v != 0
+	case int16:
+		return v != 0
+	case int32:
+		return v != 0
+	case int64:
+		return v != 0
+	case uint:
+		return v != 0
+	case uint8:
+		return v != 0
+	case uint16:
+		return v != 0
+	case uint32:
+		return v != 0
+	case uint64:
+		return v != 0
+	case float32:
+		return v != 0
+	case float64:
+		return v != 0
+	default:
+		return true
 	}
-	return status == http.StatusBadGateway || status == http.StatusServiceUnavailable || status == http.StatusGatewayTimeout
+}
+
+func truncateString(value string, limit int) string {
+	if len(value) <= limit {
+		return value
+	}
+	return value[:limit]
 }

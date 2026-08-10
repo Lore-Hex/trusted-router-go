@@ -230,29 +230,3 @@ func activityPath(params map[string]string) string {
 	}
 	return "/activity?" + encoded
 }
-
-func (c *Client) absoluteRequest(ctx context.Context, method, requestURL string) (*http.Response, error) {
-	timeout, hasTimeout := c.effectiveTimeout(nil)
-	attemptCtx, cancel := contextWithOptionalTimeout(ctx, timeout, hasTimeout)
-	req, err := http.NewRequestWithContext(attemptCtx, method, requestURL, nil)
-	if err != nil {
-		cancel()
-		return nil, err
-	}
-	for key, value := range c.headers {
-		req.Header.Set(key, value)
-	}
-	req.Header.Set("user-agent", userAgent())
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		cancel()
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, ctxErr
-		}
-		return nil, transportRetryError(err)
-	}
-	if hasTimeout {
-		resp.Body = cancelOnCloseReadCloser{ReadCloser: resp.Body, cancel: cancel}
-	}
-	return resp, nil
-}

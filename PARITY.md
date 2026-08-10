@@ -23,6 +23,36 @@ Regional failover intentionally diverges from older reference SDKs: production
 uses `api.trustedrouter.com` as a global load balancer, so the Go SDK
 re-requests the apex instead of constructing per-region API hostnames.
 
+## Stream-open retry semantics (aligned with trusted-router-py)
+
+Buffered and streaming-open requests run through the SAME transport engine
+(`transport.go do()`), so stream opens carry the full retry/failover
+semantics of the buffered path. This matches trusted-router-py's landed
+behavior, where all four request drivers share one sans-IO retry controller.
+Concretely, a stream open now:
+
+- consults `retryable()` and the `x-should-retry` verdict (previously a 429
+  or an `x-should-retry: true` was NOT retried on stream open, and an
+  `x-should-retry: false` was only honored by accident of the failover-status
+  gate) — `TestALabelledSpent502IsNotRetriedOnStreamOpen`,
+  `TestALabelledRetryableStatusIsRetriedOnStreamOpen`;
+- walks the candidate list on failoverable statuses and transport errors
+  (previously pinned to `baseURLs[0]` forever) —
+  `TestStreamOpenWalksCandidatesAndHonorsRetryAfter`,
+  `TestRegionalFailoverAndChatIdempotency`;
+- honors `retry-after`/`retry-after-ms` as the backoff floor —
+  `TestStreamOpenWalksCandidatesAndHonorsRetryAfter`;
+- retries in place when `RegionalFailover` is disabled (previously a pinned
+  client's failed stream open returned immediately: transport retry was
+  wrongly gated on the failover flag) — `TestPinnedStreamRetriesInPlace`.
+
+Divergence from trusted-router-py held constant on purpose: py gates the
+streaming transport-error ADVANCE on `regional_failover`; Go gates the same
+advance on the engine's failover flag (`spec.failover`). Both satisfy
+"the failover flag governs WHERE, never WHETHER" through their own mechanism.
+Retries still happen only before any body bytes are surfaced: a broken OPEN
+stream propagates and never reconnects.
+
 Control-plane methods use `DefaultControlBaseURL`: `Models`, `Providers`,
 `Regions`, `Credits`, `BroadcastDestinations`, `CreateBroadcastDestination`,
 `GetBroadcastDestination`, `UpdateBroadcastDestination`,
