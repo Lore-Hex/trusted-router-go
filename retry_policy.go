@@ -24,6 +24,7 @@ package trustedrouter
 // "fixed", never tested.
 
 import (
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -54,13 +55,42 @@ func shouldRetryVerdict(headers http.Header) *bool {
 	}
 }
 
+// MaxRetryAfterSeconds caps a server-supplied Retry-After floor.
+//
+// Retry-After arrives from whatever answered the socket — the gateway, a proxy
+// in front of it, an alias domain — so it is untrusted input, and it was being
+// applied as an *uncapped* floor on the sleep. strconv.ParseFloat accepts more
+// than the RFC 7231 grammar: "inf", "Inf", "infinity", "nan" and hex-float
+// forms like "0x1p1000" all parse without error. Measured on go1.23.4, a
+// Retry-After of "inf" or "1e300" saturated the float64->time.Duration
+// conversion to the maximum int64, producing a 2562047h47m16s (292 year)
+// sleep; a plain "100000" parked the caller 27h46m40s per attempt.
+//
+// 60s is above any hint a healthy gateway sends and far below the point where a
+// caller would rather have the error. Matches MAX_RETRY_AFTER_SECONDS in
+// trusted-router-py and trusted-router-js so every SDK accepts the same
+// header language.
+const MaxRetryAfterSeconds = 60.0
+
+// boundedRetryAfter clamps a parsed hint into [0, MaxRetryAfterSeconds], or
+// rejects it. Returns nil for anything that is not a usable delay — NaN, ±Inf,
+// negatives — so the caller falls through to plain jittered backoff.
+func boundedRetryAfter(seconds float64) *float64 {
+	if math.IsNaN(seconds) || math.IsInf(seconds, 0) || seconds < 0 {
+		return nil
+	}
+	bounded := math.Min(seconds, MaxRetryAfterSeconds)
+	return &bounded
+}
+
 func retryAfterSeconds(headers http.Header) *float64 {
 	// retry-after-ms wins when both are present: it is the more precise of the
 	// two, and a server that sends it means the sub-second value.
 	if rawMS := strings.TrimSpace(headers.Get("Retry-After-Ms")); rawMS != "" {
-		if millis, err := strconv.ParseFloat(rawMS, 64); err == nil && millis >= 0 {
-			seconds := millis / 1000
-			return &seconds
+		if millis, err := strconv.ParseFloat(rawMS, 64); err == nil {
+			if bounded := boundedRetryAfter(millis / 1000); bounded != nil {
+				return bounded
+			}
 		}
 	}
 	raw := headers.Get("Retry-After")
@@ -72,10 +102,7 @@ func retryAfterSeconds(headers http.Header) *float64 {
 		// Python intentionally ignores HTTP-date Retry-After values; keep Go identical.
 		return nil
 	}
-	if parsed < 0 {
-		parsed = 0
-	}
-	return &parsed
+	return boundedRetryAfter(parsed)
 }
 
 // retryable answers "may we send this again", independent of WHERE. It used to
