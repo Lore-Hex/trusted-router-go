@@ -332,10 +332,19 @@ func retrySleepDuration(attempt int, retryAfter *float64) time.Duration {
 	}
 	delay := time.Duration(mathrand.Float64() * float64(base))
 	if retryAfter != nil {
-		floor := time.Duration(*retryAfter * float64(time.Second))
-		if floor > delay {
-			delay = floor
+		// Re-clamp rather than trusting the caller: retrySleepDuration is
+		// reachable independently of the parser, and float64->time.Duration
+		// SATURATES rather than erroring, so an unbounded value lands as a
+		// 292-year timer instead of anything diagnosable.
+		if bounded := boundedRetryAfter(*retryAfter); bounded != nil {
+			floor := time.Duration(*bounded * float64(time.Second))
+			if floor > delay {
+				delay = floor
+			}
 		}
+	}
+	if ceiling := time.Duration(MaxRetryAfterSeconds * float64(time.Second)); delay > ceiling {
+		delay = ceiling
 	}
 	return delay
 }
