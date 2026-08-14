@@ -74,6 +74,22 @@ type AttestationPolicy struct {
 	AllowDebug bool `json:"allow_debug,omitempty"`
 }
 
+// PinsImageIdentity reports whether the policy constrains *which* workload image
+// is acceptable.
+//
+// Both image checks in VerifyGatewayAttestation are guarded on a non-empty
+// accepted set, so a policy that pins neither a digest nor a reference accepts
+// any genuinely-attested Confidential Space workload — it proves "some CSP VM"
+// rather than "the gateway build we published". Policy construction and
+// verification both refuse that state rather than silently downgrading the
+// guarantee.
+func (p AttestationPolicy) PinsImageIdentity() bool {
+	return len(p.ExpectedImageDigests) > 0 ||
+		p.ExpectedImageDigest != "" ||
+		len(p.ExpectedImageReferences) > 0 ||
+		p.ExpectedImageReference != ""
+}
+
 // GatewayAttestation is a verified gateway attestation result.
 type GatewayAttestation struct {
 	// CertSHA256 is the SHA-256 of the gateway TLS leaf cert committed by the JWT.
@@ -211,14 +227,26 @@ func PolicyFromTrustRelease(ctx context.Context, opts PolicyFromTrustReleaseOpti
 	if len(acceptedImageReferences) == 0 && release.ImageReference != "" {
 		acceptedImageReferences = []string{release.ImageReference}
 	}
-	return AttestationPolicy{
+	policy := AttestationPolicy{
 		GCPAudience:             audience,
 		ExpectedCertSHA256:      opts.CertSHA256,
 		ExpectedImageDigest:     release.ImageDigest,
 		ExpectedImageDigests:    acceptedImageDigests,
 		ExpectedImageReference:  release.ImageReference,
 		ExpectedImageReferences: acceptedImageReferences,
-	}, nil
+	}
+	if !policy.PinsImageIdentity() {
+		// A truncated body, an error page that happens to parse as JSON, or a
+		// schema change all land here. Returning the policy anyway would leave
+		// the caller believing it verified a specific build while both image
+		// checks silently no-op, so refuse where the degraded input is visible.
+		return AttestationPolicy{}, &AttestationVerificationError{
+			Message: "trust release pins no image identity (none of image_digest, " +
+				"accepted_image_digests, image_reference, accepted_image_references); " +
+				"refusing to build a policy that would accept any Confidential Space workload",
+		}
+	}
+	return policy, nil
 }
 
 // VerifyGatewayAttestationOptions configures VerifyGatewayAttestation.
@@ -548,6 +576,15 @@ func checkAttestationClaims(claims map[string]any, policy AttestationPolicy, non
 	audList := audienceList(claims["aud"])
 	if !containsString(audList, audience) {
 		return nil, attestationErr(fmt.Sprintf("audience %s not in JWT aud %s", pyRepr(audience), pyRepr(audList)), nil)
+	}
+
+	if !policy.PinsImageIdentity() {
+		// Defence in depth for hand-constructed policies: both image checks
+		// below are guarded on a non-empty accepted set, so reaching them with
+		// nothing pinned would accept any attested workload.
+		return nil, attestationErr(
+			"attestation policy pins no image identity; refusing to verify against a "+
+				"policy that cannot distinguish the gateway from any other workload", nil)
 	}
 
 	submods, _ := claims["submods"].(map[string]any)
