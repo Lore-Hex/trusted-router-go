@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -953,6 +954,42 @@ func TestClassifyTransportError(t *testing.T) {
 		classify(t, writeErr, "write_timeout")
 	})
 
+	t.Run("plaintext server on an https url is tls", func(t *testing.T) {
+		// net/http REPLACES the tls.RecordHeaderError with the exported
+		// ErrSchemeMismatch sentinel here, so the typed TLS error never
+		// reaches the SDK and only the sentinel identifies the failure.
+		// trusted-router-py gets an ssl.SSLError for the same server.
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+		defer server.Close()
+		_, err := http.Get("https://" + strings.TrimPrefix(server.URL, "http://") + "/")
+		if !errors.Is(err, http.ErrSchemeMismatch) {
+			t.Fatalf("err = %v, want net/http's scheme-mismatch sentinel", err)
+		}
+		classify(t, err, "tls")
+	})
+
+	t.Run("http2 stream reset is protocol_error", func(t *testing.T) {
+		// A real HTTP/2 stream reset from the peer. Its message —
+		// "stream error: stream ID 1; INTERNAL_ERROR; received from peer" —
+		// contains neither "http2" nor "PROTOCOL_ERROR", which is why the
+		// commonest real HTTP/2 failure used to classify as "unknown".
+		server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			panic(http.ErrAbortHandler)
+		}))
+		server.EnableHTTP2 = true
+		server.Config.ErrorLog = log.New(io.Discard, "", 0)
+		server.StartTLS()
+		defer server.Close()
+		_, err := server.Client().Get(server.URL)
+		if err == nil {
+			t.Fatal("expected the reset stream to surface an error")
+		}
+		if !strings.Contains(err.Error(), "stream error") {
+			t.Fatalf("err = %v, want an http2 stream error", err)
+		}
+		classify(t, err, "protocol_error")
+	})
+
 	t.Run("unexpected eof is io_error", func(t *testing.T) {
 		classify(t, fmt.Errorf("read body: %w", io.ErrUnexpectedEOF), "io_error")
 	})
@@ -968,7 +1005,11 @@ func TestTelemetryHeaderBoundsAndGrammar(t *testing.T) {
 		return &requestRecorder{
 			streaming: true,
 			attempts: []telemetryAttempt{{
-				index:      0,
+				// The previous attempt's index must be currentIndex-1: the
+				// po/pc/ph/pm keys are defined as THAT attempt's facts, and
+				// headerValue refuses to describe any other attempt under
+				// this attempt's number.
+				index:      98,
 				host:       "europe_west4",
 				outcome:    "transport_error",
 				errorClass: "connect_timeout",
@@ -1025,6 +1066,17 @@ func TestTelemetryHeaderBoundsAndGrammar(t *testing.T) {
 		recorder.attempts[0].host = long
 		if got := recorder.headerValue(); got != "" {
 			t.Fatalf("headerValue() = %q, want suppression", got)
+		}
+	})
+
+	t.Run("a gap in the attempt records sends nothing", func(t *testing.T) {
+		// The immediately preceding attempt lost its record (a recovered
+		// callback panic), so its facts are gone. Reporting the attempt
+		// before it under this attempt's index would be a false report.
+		recorder := worstCase()
+		recorder.attempts[0].index = 97
+		if got := recorder.headerValue(); got != "" {
+			t.Fatalf("headerValue() = %q, want suppression when the previous attempt has no record", got)
 		}
 	})
 
@@ -1105,5 +1157,154 @@ func TestUserAgentMatchesTelemetryContractGrammar(t *testing.T) {
 	}
 	if !strings.HasPrefix(got, "trusted-router-go/"+Version) {
 		t.Fatalf("userAgent() = %q does not carry Version %q", got, Version)
+	}
+}
+
+// TestTelemetryHostAllowlistMatchesSDKConstants keeps telemetry's own
+// hostname list honest against the SDK's base-URL constants. Telemetry
+// deliberately does not read the exported AliasAPIBaseURLs var (see
+// TestMutatedAliasListCannotAttractTelemetry), which means a genuine alias
+// or region change would otherwise silently stop being named — so the
+// agreement between the two is asserted here instead of assumed.
+func TestTelemetryHostAllowlistMatchesSDKConstants(t *testing.T) {
+	if len(AliasAPIBaseURLs) != 2 {
+		t.Fatalf("AliasAPIBaseURLs has %d entries; telemetry's host vocabulary (ally, uptime) must be updated with it", len(AliasAPIBaseURLs))
+	}
+	for _, tc := range []struct{ url, want string }{
+		{DefaultAPIBaseURL, "apex"},
+		{AliasAPIBaseURLs[0], "ally"},
+		{AliasAPIBaseURLs[1], "uptime"},
+	} {
+		_, host, ok := telemetrySchemeHost(tc.url)
+		if !ok {
+			t.Fatalf("%q is not a parseable base URL", tc.url)
+		}
+		if got := telemetryHostnames[host]; got != tc.want {
+			t.Errorf("telemetryHostnames[%q] = %q, want %q — update telemetryHostnames alongside the SDK's base-URL constants", host, got, tc.want)
+		}
+	}
+	// The control base is named by suffix rather than by the list.
+	if got := hostEnum(DefaultControlBaseURL); got != "control" {
+		t.Errorf("hostEnum(DefaultControlBaseURL) = %q, want %q", got, "control")
+	}
+	// Every name telemetry can produce must be in the closed §5.2 vocabulary.
+	allowed := map[string]bool{}
+	for _, host := range telemetryHosts {
+		allowed[host] = true
+	}
+	for host, name := range telemetryHostnames {
+		if !allowed[name] {
+			t.Errorf("telemetryHostnames[%q] = %q, which is outside the closed Host vocabulary", host, name)
+		}
+	}
+}
+
+// TestMutatedAliasListCannotAttractTelemetry is the privacy test for the
+// host vocabulary. AliasAPIBaseURLs is an exported var, so a consumer can
+// point an entry at their own gateway. Telemetry must not follow it there:
+// naming a caller-supplied host "ally" would resolve telemetry ON for it and
+// send x-tr-client to a host that is not TrustedRouter's to measure (§3.2).
+func TestMutatedAliasListCannotAttractTelemetry(t *testing.T) {
+	clearTelemetryEnv(t)
+	const selfHosted = "https://gateway.self-hosted.example/v1"
+	original := append([]string(nil), AliasAPIBaseURLs...)
+	t.Cleanup(func() { AliasAPIBaseURLs = original })
+	AliasAPIBaseURLs = []string{selfHosted, "https://second.self-hosted.example/v1"}
+
+	if got := hostEnum(selfHosted); got != "custom" {
+		t.Fatalf("hostEnum(%q) = %q, want %q — a mutated alias slice must not name a caller's host", selfHosted, got, "custom")
+	}
+	// The genuine aliases are still named, because telemetry reads its own list.
+	if got := hostEnum(original[0]); got != "ally" {
+		t.Fatalf("hostEnum(%q) = %q, want %q", original[0], got, "ally")
+	}
+
+	// ...and on the wire: a client pointed at that host sends no header.
+	var seen http.Header
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer server.Close()
+	sdk, err := NewClient(Options{APIKey: "k", BaseURL: selfHosted, HTTPClient: &http.Client{
+		Transport: newHostRoutingTransport(map[string]string{"gateway.self-hosted.example": server.URL}),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sdk.telemetry {
+		t.Error("telemetry resolved ON for a caller's self-hosted gateway")
+	}
+	var out map[string]any
+	if err := sdk.Request(context.Background(), http.MethodGet, "/models", nil, &out, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := seen.Values("x-tr-client"); len(got) != 0 {
+		t.Fatalf("x-tr-client sent to a mutated-alias host: %#v", got)
+	}
+}
+
+// innerHostileError and nestedHostileError together defeat fmt's own panic
+// recovery: fmt renders a panicking Error() as a "%!s(PANIC=...)" marker, but
+// re-panics when the value the Error() method panics WITH also has a
+// panicking Error(). That is the shape that makes telemetry classification
+// panic for real, since http.Client.Do's *url.Error wrapper renders the
+// inner value through fmt.
+type innerHostileError struct{}
+
+func (innerHostileError) Error() string { panic("inner hostile Error method") }
+
+type nestedHostileError struct{}
+
+func (nestedHostileError) Error() string { panic(innerHostileError{}) }
+
+// TestLostAttemptRecordDoesNotRewindTheAttemptIndex pins what a recovered
+// telemetry panic may and may not cost. It may cost that attempt's record.
+// It may not corrupt the attempts that follow: when the index was derived
+// from the number of stored records, a dropped record rewound the counter and
+// every later attempt re-sent a=0 — a valid-looking header claiming to be the
+// first attempt of the call. §2.2 permits missing telemetry, never false
+// telemetry.
+func TestLostAttemptRecordDoesNotRewindTheAttemptIndex(t *testing.T) {
+	clearTelemetryEnv(t)
+	defer stubSleep(func(context.Context, time.Duration) error { return nil })()
+
+	var headers []string
+	calls := 0
+	sdk, err := NewClient(Options{APIKey: "k", MaxRetries: intPtr(3), HTTPClient: newRoundTripClient(func(r *http.Request) (*http.Response, error) {
+		headers = append(headers, r.Header.Get("x-tr-client"))
+		calls++
+		if calls <= 2 {
+			return nil, nestedHostileError{}
+		}
+		return jsonResponse(http.StatusOK, map[string]any{"ok": true}, nil), nil
+	})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out map[string]any
+	// §2.2 first: the hostile value must not fail the request.
+	if err := sdk.Request(context.Background(), http.MethodGet, "/models", nil, &out, nil); err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	if len(headers) != 3 {
+		t.Fatalf("attempts = %d, want 3", len(headers))
+	}
+	if headers[0] != "v=1;a=0;s=0" {
+		t.Fatalf("attempt 0 x-tr-client = %q, want %q", headers[0], "v=1;a=0;s=0")
+	}
+	// Attempts 1 and 2 lost their predecessor's record, so they have no
+	// previous-attempt facts to report and must send NOTHING. What they must
+	// never do is re-claim a=0.
+	for i, header := range headers[1:] {
+		attempt := i + 1
+		if header == "" {
+			continue
+		}
+		fields := parseTelemetryHeader(t, header)
+		if fields["a"] != strconv.Itoa(attempt) {
+			t.Errorf("attempt %d x-tr-client = %q, which reports a=%s: a dropped record must not rewind the attempt index", attempt, header, fields["a"])
+		}
 	}
 }

@@ -25,6 +25,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/http"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -98,16 +99,37 @@ var (
 	}
 )
 
-// telemetryRegionBaseURLs maps the region-pinned base URLs to their host
-// enum (§5.2). The per-region hostnames are not failover candidates in this
-// SDK (regional failover re-requests the apex), but the telemetry
-// vocabulary still names them so a region-pinned base URL reports its
-// region rather than "custom". Cross-checked against trusted-router-py
-// _constants.REGION_BASE_URLS.
-var telemetryRegionBaseURLs = map[string]string{
-	"https://api-us-central1.quillrouter.com/v1":  "us_central1",
-	"https://api-us-east4.quillrouter.com/v1":     "us_east4",
-	"https://api-europe-west4.quillrouter.com/v1": "europe_west4",
+// telemetryHostCustom is the fail-closed host value: a host telemetry cannot
+// name is never measured and never carries the header (§3.2).
+const telemetryHostCustom = "custom"
+
+// telemetryHostnames is telemetry's OWN list of the hostnames it is allowed
+// to name, and the only source hostEnum consults.
+//
+// It deliberately does NOT read AliasAPIBaseURLs. That is an exported var,
+// not a constant: a consumer can reorder it (swapping which host reports
+// "ally" and which reports "uptime"), shorten it (turning a real alias into
+// "custom"), or point an entry at their own gateway — and a hostEnum that
+// read the live slice would then name that gateway "ally", resolve
+// telemetry ON for it, and send x-tr-client to a host that is not
+// TrustedRouter's to measure. Telemetry's vocabulary must not be
+// caller-writable.
+//
+// The per-region hostnames are not failover candidates in this SDK
+// (regional failover re-requests the apex), but the vocabulary still names
+// them so a region-pinned base URL reports its region rather than "custom".
+// Cross-checked against trusted-router-py _constants.REGION_BASE_URLS.
+//
+// TestTelemetryHostAllowlistMatchesSDKConstants pins this list against the
+// SDK's own base-URL constants, so a genuine alias or region change cannot
+// land without updating telemetry alongside it.
+var telemetryHostnames = map[string]string{
+	"api.trustedrouter.com":            "apex",
+	"api.allyrouter.com":               "ally",
+	"api.uptimerouter.com":             "uptime",
+	"api-us-central1.quillrouter.com":  "us_central1",
+	"api-us-east4.quillrouter.com":     "us_east4",
+	"api-europe-west4.quillrouter.com": "europe_west4",
 }
 
 var (
@@ -130,11 +152,6 @@ func telemetrySchemeHost(rawURL string) (scheme, host string, ok bool) {
 	return strings.ToLower(parsed.Scheme), strings.ToLower(parsed.Hostname()), true
 }
 
-func sameTelemetrySchemeHost(scheme, host, constantURL string) bool {
-	constScheme, constHost, ok := telemetrySchemeHost(constantURL)
-	return ok && scheme == constScheme && host == constHost
-}
-
 // isTelemetryControlHost reports whether the URL is the TrustedRouter
 // control plane: https on trustedrouter.com or any subdomain. Mirrors
 // trusted-router-py _control_host.
@@ -147,34 +164,21 @@ func isTelemetryControlHost(rawURL string) bool {
 }
 
 // hostEnum maps a base URL to the closed telemetry host vocabulary (§5.2).
-// It compares scheme+hostname against the SDK's own base-URL constants, so
-// the mapping can never disagree with where requests are actually sent.
-// Anything unrecognized is "custom": a self-hosted gateway is not
-// TrustedRouter's to measure (§3.2).
+// It matches https scheme + hostname against telemetryHostnames, telemetry's
+// own non-writable list, then the control-plane suffix. Anything else is
+// "custom": a self-hosted gateway is not TrustedRouter's to measure (§3.2).
 func hostEnum(baseURL string) string {
 	scheme, host, ok := telemetrySchemeHost(baseURL)
-	if !ok {
-		return "custom"
+	if !ok || scheme != "https" {
+		return telemetryHostCustom
 	}
-	if sameTelemetrySchemeHost(scheme, host, DefaultAPIBaseURL) {
-		return "apex"
+	if name, named := telemetryHostnames[host]; named {
+		return name
 	}
-	aliases := AliasAPIBaseURLs
-	if len(aliases) > 0 && sameTelemetrySchemeHost(scheme, host, aliases[0]) {
-		return "ally"
-	}
-	if len(aliases) > 1 && sameTelemetrySchemeHost(scheme, host, aliases[1]) {
-		return "uptime"
-	}
-	for regionURL, region := range telemetryRegionBaseURLs {
-		if sameTelemetrySchemeHost(scheme, host, regionURL) {
-			return region
-		}
-	}
-	if sameTelemetrySchemeHost(scheme, host, DefaultControlBaseURL) || isTelemetryControlHost(baseURL) {
+	if isTelemetryControlHost(baseURL) {
 		return "control"
 	}
-	return "custom"
+	return telemetryHostCustom
 }
 
 // resolveTelemetryEnabled resolves the §6.3 opt-out precedence: explicit
@@ -195,7 +199,7 @@ func resolveTelemetryEnabled(explicit *bool, baseURL, controlBaseURL string, get
 	if strings.TrimSpace(getenv("DO_NOT_TRACK")) == "1" {
 		return false
 	}
-	return hostEnum(baseURL) != "custom" && isTelemetryControlHost(controlBaseURL)
+	return hostEnum(baseURL) != telemetryHostCustom && isTelemetryControlHost(controlBaseURL)
 }
 
 // classifyTransportError maps a transport error surfaced by this SDK's
@@ -291,6 +295,14 @@ func isReadWriteError(err error) bool {
 }
 
 func isTLSError(err error) bool {
+	// net/http REPLACES the tls.RecordHeaderError with this sentinel when a
+	// plaintext server answers an HTTPS client, so the typed TLS error is
+	// gone by the time the SDK sees it and only the sentinel identifies the
+	// failure. trusted-router-py sees an ssl.SSLError for the same server and
+	// classifies it "tls"; without this check the class was "unknown".
+	if errors.Is(err, http.ErrSchemeMismatch) {
+		return true
+	}
 	var (
 		certVerification *tls.CertificateVerificationError
 		recordHeader     tls.RecordHeaderError
@@ -310,12 +322,24 @@ func isTLSError(err error) bool {
 // isProtocolError sniffs the HTTP-protocol failures net/http surfaces only
 // as strings: the bundled http2 transport's errors and HTTP/1.x response
 // parse failures have no exported types to errors.As against.
+//
+// The two "…error: stream ID"/"connection error:" forms are how the bundled
+// http2 StreamError and ConnectionError actually render (h2_bundle.go
+// formats them as "stream error: stream ID %d; %v" and "connection error:
+// %s"). Neither string contains "http2", so a peer resetting a stream — the
+// commonest real HTTP/2 failure, e.g. "stream error: stream ID 1;
+// INTERNAL_ERROR; received from peer" — used to classify as "unknown".
+// trusted-router-py sees httpx.RemoteProtocolError for these and reports
+// protocol_error. The reset/io classes are checked before this function, so
+// matching on these substrings cannot steal a more specific class.
 func isProtocolError(err error) bool {
 	message := err.Error()
 	return strings.Contains(message, "http2") ||
 		strings.Contains(message, "HTTP/2") ||
 		strings.Contains(message, "malformed HTTP") ||
-		strings.Contains(message, "PROTOCOL_ERROR")
+		strings.Contains(message, "PROTOCOL_ERROR") ||
+		strings.Contains(message, "stream error: stream ID") ||
+		strings.Contains(message, "connection error:")
 }
 
 func clampDurationMS(d time.Duration) int64 {
@@ -349,8 +373,15 @@ type telemetryAttempt struct {
 // header_value flow. All methods are nil-receiver safe so the engine wiring
 // stays unconditional (§2.2).
 type requestRecorder struct {
-	streaming    bool
-	attempts     []telemetryAttempt
+	streaming bool
+	attempts  []telemetryAttempt
+	// nextIndex counts attempts STARTED, independently of attempts
+	// successfully recorded. Deriving the index from len(attempts) instead
+	// meant a recovered callback panic — which loses that attempt's record —
+	// silently rewound the count, so the retry re-sent a=0 and claimed to be
+	// the first attempt of the call. A dropped record must cost a record, not
+	// corrupt the numbering of the ones that follow.
+	nextIndex    int
 	failoverUsed bool
 	firstStarted time.Time
 	attemptStart time.Time
@@ -378,6 +409,14 @@ func (r *requestRecorder) beginAttempt(baseURL string) {
 		return
 	}
 	defer recoverTelemetryPanic()
+	// Order matters, and both of these come before anything that can panic.
+	// The index advances first so a panic below cannot make the next attempt
+	// reuse this one's number, and the host is reset to the fail-closed value
+	// first so a panic cannot leave the PREVIOUS attempt's host in place and
+	// let a header ride to a host this attempt was not cleared for.
+	r.currentIndex = r.nextIndex
+	r.nextIndex++
+	r.currentHost = telemetryHostCustom
 	now := time.Now()
 	if !r.begun {
 		r.firstStarted = now
@@ -385,7 +424,6 @@ func (r *requestRecorder) beginAttempt(baseURL string) {
 	}
 	r.attemptStart = now
 	r.currentHost = hostEnum(baseURL)
-	r.currentIndex = len(r.attempts)
 }
 
 // onResponse records an attempt that produced an HTTP response.
@@ -443,19 +481,29 @@ func (r *requestRecorder) onTransportError(err error, openTimedOut bool) {
 }
 
 // onMoved marks that the candidate index advanced after the last recorded
-// attempt (§3.2 fo).
+// attempt (§3.2 fo). failoverUsed is a fact about the CALL, so it is set even
+// when the attempt that moved lost its record: fo describes whether this call
+// ever left its first host, and answering "no" because a record was dropped
+// would be a false report.
 func (r *requestRecorder) onMoved() {
-	if r == nil || len(r.attempts) == 0 {
+	if r == nil {
 		return
 	}
 	defer recoverTelemetryPanic()
-	r.attempts[len(r.attempts)-1].moved = true
 	r.failoverUsed = true
+	if last := len(r.attempts) - 1; last >= 0 {
+		r.attempts[last].moved = true
+	}
 }
 
+// storeAttempt appends the record for the attempt in flight, replacing it if
+// that attempt is re-recorded. Records are keyed by their own index rather
+// than by slice position: a dropped record leaves a GAP in the indices, and
+// position-based storage would then file later attempts under earlier
+// attempts' numbers.
 func (r *requestRecorder) storeAttempt(attempt telemetryAttempt) {
-	if attempt.index < len(r.attempts) {
-		r.attempts[attempt.index] = attempt
+	if last := len(r.attempts) - 1; last >= 0 && r.attempts[last].index == attempt.index {
+		r.attempts[last] = attempt
 		return
 	}
 	r.attempts = append(r.attempts, attempt)
@@ -475,7 +523,7 @@ func (r *requestRecorder) headerValue() (value string) {
 			value = ""
 		}
 	}()
-	if r == nil || !r.begun || r.currentHost == "custom" {
+	if r == nil || !r.begun || r.currentHost == telemetryHostCustom {
 		return ""
 	}
 	if r.currentIndex > 99 {
@@ -490,6 +538,13 @@ func (r *requestRecorder) headerValue() (value string) {
 			return ""
 		}
 		previous := r.attempts[len(r.attempts)-1]
+		if previous.index != r.currentIndex-1 {
+			// The immediately preceding attempt has no record — it was lost
+			// to a recovered callback panic. po/pc/ph/pm are defined as the
+			// PREVIOUS attempt's facts, so describing an older attempt under
+			// this attempt's index would be a false report: send nothing.
+			return ""
+		}
 		outcome := previous.outcome
 		errorClass := previous.errorClass
 		if errorClass == "" {

@@ -277,7 +277,7 @@ out-of-engine attach point for the later beacon sender.
 | Python symbol | Go symbol | Notes |
 | --- | --- | --- |
 | `RequestRecorder` | `requestRecorder` (unexported) | Header-channel subset: begin_attempt/on_response/on_transport_error/on_moved/header_value. Beacon-only fields (ttfb, request_id, retry_after, sampling) arrive with the beacon PR. |
-| `host_enum` | `hostEnum` | Same closed vocabulary, same scheme+hostname comparison against the SDK's own base-URL constants. |
+| `host_enum` | `hostEnum` | Same closed vocabulary, same scheme+hostname comparison. Go matches against `telemetryHostnames`, telemetry's own non-writable list, rather than reading the exported `AliasAPIBaseURLs` var — Python's aliases are an immutable tuple, Go's are a mutable exported slice, and a caller who repoints one must not thereby get their own host named and measured. `TestTelemetryHostAllowlistMatchesSDKConstants` pins the list against the SDK constants. |
 | `classify_transport_error` | `classifyTransportError` | httpx exception classes become Go `net`/`crypto/tls`/`syscall` error-chain checks; classified before `transportRetryError` flattens the chain. |
 | `resolve_telemetry_enabled` | `resolveTelemetryEnabled` | Same precedence: explicit > `TRUSTEDROUTER_TELEMETRY` > `DO_NOT_TRACK` > default on only for TrustedRouter hosts. |
 | `telemetry: bool | None` client arg | `Options.Telemetry *bool` | Same nil-resolves semantics beside `RegionalFailover`. |
