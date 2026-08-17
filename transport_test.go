@@ -44,15 +44,21 @@ type nestedPanickingTransportError struct{}
 
 func (nestedPanickingTransportError) Error() string { panic(panickingTransportError{}) }
 
-// redactingError renders one thing through fmt.Formatter and another through
-// Error(): the shape that makes a direct .Error() call a leak rather than a
-// mere formatting change.
+// redactingError renders three different ways: redacted under the "%s" verb,
+// verbose under "%v", and unredacted from Error(). That is the real shape of
+// a diagnostics-aware error type, and it makes the rendering path a privacy
+// decision rather than a formatting detail — a direct .Error() call and a
+// fmt.Sprint/"%v" call each publish something "%s" withholds.
 type redactingError struct{}
 
 func (redactingError) Error() string { return "authorization=Bearer sk-live-SECRET" }
 
 func (redactingError) Format(f fmt.State, verb rune) {
-	_, _ = io.WriteString(f, "authorization=[redacted]")
+	if verb == 's' {
+		_, _ = io.WriteString(f, "authorization=[redacted]")
+		return
+	}
+	_, _ = io.WriteString(f, "authorization=Bearer sk-live-SECRET (verbose diagnostics)")
 }
 
 // hostileBody is a response body whose Read fails with the supplied error.
@@ -177,17 +183,26 @@ func TestTransportErrorMessageIsBoundedIncludingPrefix(t *testing.T) {
 	}
 }
 
-// TestFormatterRenderingIsPreserved pins the rendering path. The SDK
-// flattens through fmt, so an error that redacts in its Format method keeps
-// redacting; a direct err.Error() call would bypass Format and publish the
-// secret into the SDK error message and from there into the caller's logs.
+// TestFormatterRenderingIsPreserved pins the rendering path down to the
+// VERB. The SDK flattens with "%s", which is what the code did before the
+// helper existed, so an error that redacts under "%s" keeps redacting. Both
+// nearby alternatives fail this test, which is the point of it: a direct
+// err.Error() call bypasses Format and publishes the credential, and
+// fmt.Sprint (or "%v") asks the same formatter for its verbose rendering and
+// publishes it too. Either way the secret ends up in InternalError.Message
+// and from there in the caller's logs.
 func TestFormatterRenderingIsPreserved(t *testing.T) {
 	internal := streamErrorFor(t, redactingError{})
 	if strings.Contains(internal.Message, "sk-live-SECRET") {
-		t.Fatalf("message = %q leaked the value the caller's Format method withholds", internal.Message)
+		t.Fatalf("message = %q leaked what the caller's %%s rendering withholds", internal.Message)
 	}
 	if !strings.Contains(internal.Message, "authorization=[redacted]") {
-		t.Fatalf("message = %q, want the Format method's rendering", internal.Message)
+		t.Fatalf("message = %q, want the Format method's %%s rendering", internal.Message)
+	}
+	// Guard the helper directly too, so the pin does not depend on the
+	// stream path staying the way in.
+	if got := safeErrorMessage(redactingError{}); got != "authorization=[redacted]" {
+		t.Fatalf("safeErrorMessage(redacting) = %q, want the %%s rendering", got)
 	}
 }
 

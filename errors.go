@@ -201,12 +201,15 @@ func transportRetryError(err error) error {
 // code the SDK does not control, at the exact moment the SDK is trying to
 // report a failure.
 //
-// Rendering goes through fmt rather than a direct err.Error() call, so an
-// error that implements fmt.Formatter renders exactly as it did before this
-// helper existed — including any redaction it performs there. A direct
-// .Error() call would silently bypass that Format method and could surface
-// text the caller's own formatter deliberately withholds
-// (TestFormatterRenderingIsPreserved).
+// Rendering goes through fmt with the "%s" verb, not a direct err.Error()
+// call and not fmt.Sprint, so an error that implements fmt.Formatter renders
+// exactly as it did before this helper existed — including any redaction it
+// performs there. Both alternatives are leaks waiting to happen: a direct
+// .Error() call bypasses the Format method entirely, and fmt.Sprint (or
+// "%v") hands it the VERBOSE verb, which a formatter may legitimately answer
+// with the diagnostics it withholds from "%s". The verb is part of the
+// contract with the caller's error, so it is pinned by
+// TestFormatterRenderingIsPreserved.
 //
 // The recover guard covers what fmt cannot. fmt recovers a panicking Error
 // method and renders a "%!s(PANIC=...)" marker, but it re-panics when the
@@ -232,7 +235,7 @@ func safeErrorMessage(err error) (message string) {
 	if err == nil {
 		return "unknown transport error"
 	}
-	return truncateString(fmt.Sprint(err), transportErrorMessageMaxBytes)
+	return truncateString(fmt.Sprintf("%s", err), transportErrorMessageMaxBytes)
 }
 
 func decodeResponse(ctx context.Context, resp *http.Response, out any) error {
