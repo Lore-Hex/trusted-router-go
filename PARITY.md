@@ -264,3 +264,23 @@ absolute metadata URLs rather than either `/v1` plane.
 | `GatewayAttestation.as_dict` | `GatewayAttestation.AsMap` | Compact result summary. |
 | `policy_from_trust_release` | `PolicyFromTrustRelease` | Same defaults; Go takes an options struct. |
 | `verify_gateway_attestation` | `VerifyGatewayAttestation` | Same JWT/JWKS/claim verification. |
+
+## Client telemetry header channel (`_telemetry.py`)
+
+Contract v1 of `docs/client-telemetry.md` (Lore-Hex/quill-router), header
+channel only. The beacon channel is deliberately absent: the contract's
+rollout ordering ships header-only PRs in the non-Python SDKs (§9 step 7)
+and forbids beacons in a second SDK until the Python contract has been live
+and calibrated (§10). `absoluteRequest` in `transport.go` is the reserved
+out-of-engine attach point for the later beacon sender.
+
+| Python symbol | Go symbol | Notes |
+| --- | --- | --- |
+| `RequestRecorder` | `requestRecorder` (unexported) | Header-channel subset: begin_attempt/on_response/on_transport_error/on_moved/header_value. Beacon-only fields (ttfb, request_id, retry_after, sampling) arrive with the beacon PR. |
+| `host_enum` | `hostEnum` | Same closed vocabulary, same scheme+hostname comparison against the SDK's own base-URL constants. |
+| `classify_transport_error` | `classifyTransportError` | httpx exception classes become Go `net`/`crypto/tls`/`syscall` error-chain checks; classified before `transportRetryError` flattens the chain. |
+| `resolve_telemetry_enabled` | `resolveTelemetryEnabled` | Same precedence: explicit > `TRUSTEDROUTER_TELEMETRY` > `DO_NOT_TRACK` > default on only for TrustedRouter hosts. |
+| `telemetry: bool | None` client arg | `Options.Telemetry *bool` | Same nil-resolves semantics beside `RegionalFailover`. |
+| `TELEMETRY_*` constants | unexported `telemetry*` constants | Pinned by `TestTelemetryParityConstants` (beacon path, schema version, Host/Endpoint/Outcome/ErrorClass enums). |
+| `TelemetryReporter` | N/A | Beacon sender; deferred per §9/§10 as above. |
+| `telemetry_sample_rate` client arg | N/A | Governs beacon sampling only; arrives with the beacon PR. |

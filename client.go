@@ -7,6 +7,7 @@ package trustedrouter
 
 import (
 	"net/http"
+	"os"
 	"strings"
 	"time"
 )
@@ -42,6 +43,15 @@ type Options struct {
 	// The apex is a global load balancer; failover is handled server-side, so the
 	// SDK re-requests the apex rather than pinning per-region hosts.
 	RegionalFailover *bool
+	// Telemetry enables or disables the client-observed reliability telemetry
+	// header (`x-tr-client`, contract v1). The header is content-free — closed
+	// enums and bounded integers only — and is never sent to custom base URLs
+	// or on control-plane calls. Nil resolves from the environment:
+	// TRUSTEDROUTER_TELEMETRY ({0,false,off,no} disables, {1,true,on,yes}
+	// enables), then DO_NOT_TRACK=1 disables, then default on only when both
+	// the inference base and the control base are TrustedRouter hosts.
+	// Opting out does not change the User-Agent.
+	Telemetry *bool
 }
 
 // CallOptions configures a single TrustedRouter API call.
@@ -73,6 +83,7 @@ type Client struct {
 	workspaceID      string
 	maxRetries       int
 	regionalFailover bool
+	telemetry        bool
 	baseURLs         []string
 }
 
@@ -124,6 +135,7 @@ func NewClient(opts Options) (*Client, error) {
 		workspaceID:      opts.WorkspaceID,
 		maxRetries:       maxRetries,
 		regionalFailover: failoverEnabled,
+		telemetry:        resolveTelemetryEnabled(opts.Telemetry, baseURL, controlBaseURL, os.Getenv),
 		baseURLs:         inferenceBaseURLs(baseURL),
 	}, nil
 }

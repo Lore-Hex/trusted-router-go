@@ -1,0 +1,806 @@
+package trustedrouter
+
+// Header-channel parity tests for the client-observed reliability telemetry
+// contract v1 (§6.4 header subset). Every wire assertion drives the REAL
+// engine loop — do() against httptest servers or an injected RoundTripper —
+// never a reimplementation of the header logic.
+
+import (
+	"bufio"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"reflect"
+	"regexp"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+)
+
+// newHostRoutingTransport routes requests for real TrustedRouter hostnames
+// to local test servers, so engine tests exercise the real candidate URLs —
+// and therefore the real host mapping — without touching the network.
+func newHostRoutingTransport(routes map[string]string) http.RoundTripper {
+	return hostRoutingTransport(routes)
+}
+
+type hostRoutingTransport map[string]string
+
+func (routes hostRoutingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	target, ok := routes[req.URL.Hostname()]
+	if !ok {
+		return nil, fmt.Errorf("unrouted host %q", req.URL.Host)
+	}
+	targetURL, err := url.Parse(target)
+	if err != nil {
+		return nil, err
+	}
+	clone := req.Clone(req.Context())
+	clone.URL.Scheme = targetURL.Scheme
+	clone.URL.Host = targetURL.Host
+	clone.Host = ""
+	return http.DefaultTransport.RoundTrip(clone)
+}
+
+func parseTelemetryHeader(t *testing.T, header string) map[string]string {
+	t.Helper()
+	if header == "" {
+		t.Fatal("missing x-tr-client header")
+	}
+	fields := map[string]string{}
+	for _, pair := range strings.Split(header, ";") {
+		key, value, ok := strings.Cut(pair, "=")
+		if !ok {
+			t.Fatalf("malformed x-tr-client segment %q in %q", pair, header)
+		}
+		if _, duplicate := fields[key]; duplicate {
+			t.Fatalf("duplicate x-tr-client key %q in %q", key, header)
+		}
+		fields[key] = value
+	}
+	return fields
+}
+
+func requireBoundedMs(t *testing.T, fields map[string]string, key string) {
+	t.Helper()
+	parsed, err := strconv.Atoi(fields[key])
+	if err != nil || parsed < 0 || parsed > 3_600_000 {
+		t.Fatalf("%s = %q, want an integer in 0..3600000", key, fields[key])
+	}
+}
+
+func clearTelemetryEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("TRUSTEDROUTER_TELEMETRY", "")
+	t.Setenv("DO_NOT_TRACK", "")
+}
+
+func TestXTRClientHeaderOnAttemptZero(t *testing.T) {
+	clearTelemetryEnv(t)
+
+	t.Run("buffered", func(t *testing.T) {
+		var seen http.Header
+		sdk, err := NewClient(Options{APIKey: "k", HTTPClient: newRoundTripClient(func(r *http.Request) (*http.Response, error) {
+			seen = r.Header.Clone()
+			return jsonResponse(http.StatusOK, map[string]any{"ok": true}, nil), nil
+		})})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out map[string]any
+		if err := sdk.Request(context.Background(), http.MethodGet, "/models", nil, &out, nil); err != nil {
+			t.Fatal(err)
+		}
+		if got := seen.Values("x-tr-client"); len(got) != 1 || got[0] != "v=1;a=0;s=0" {
+			t.Fatalf("x-tr-client = %#v, want exactly [%q]", got, "v=1;a=0;s=0")
+		}
+	})
+
+	t.Run("streaming", func(t *testing.T) {
+		var seen http.Header
+		sdk, err := NewClient(Options{APIKey: "k", HTTPClient: newRoundTripClient(func(r *http.Request) (*http.Response, error) {
+			seen = r.Header.Clone()
+			headers := http.Header{}
+			headers.Set("Content-Type", "text/event-stream")
+			return textResponse(http.StatusOK, "data: {\"id\":\"c\",\"choices\":[]}\n\ndata: [DONE]\n\n", headers), nil
+		})})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := sdk.ChatCompletions(context.Background(), ChatRequest{
+			Messages: []map[string]any{{"role": "user", "content": "hi"}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if got := seen.Values("x-tr-client"); len(got) != 1 || got[0] != "v=1;a=0;s=1" {
+			t.Fatalf("x-tr-client = %#v, want exactly [%q]", got, "v=1;a=0;s=1")
+		}
+	})
+}
+
+func TestXTRClientRetryVectorMatchesContractExample(t *testing.T) {
+	// The contract's §3.2 worked example, byte for byte: a retry after a
+	// connect timeout on the apex that moved to an alias. The durations are
+	// timing-dependent on the wire, so the recorder state is laid out
+	// directly and the REAL assembler renders it.
+	//
+	// Note the prose example pairs po=transport_error with pc=connect_timeout,
+	// but trusted-router-py's executable RequestRecorder emits po=timeout for
+	// every timeout exception — and the contract's preamble says the modules
+	// win over the document. This vector therefore pins the ASSEMBLER's
+	// rendering of the documented state; the live outcome for a real dial
+	// timeout is pinned by TestDialTimeoutEmitsConnectTimeoutOnRetryHeader.
+	start := time.Now()
+	recorder := &requestRecorder{
+		streaming: true,
+		attempts: []telemetryAttempt{{
+			index:      0,
+			host:       "apex",
+			outcome:    "transport_error",
+			errorClass: "connect_timeout",
+			elapsedMS:  10012,
+			moved:      true,
+		}},
+		failoverUsed: true,
+		firstStarted: start,
+		attemptStart: start.Add(10530 * time.Millisecond),
+		currentHost:  "ally",
+		currentIndex: 1,
+		begun:        true,
+	}
+	want := "v=1;a=1;po=transport_error;pc=connect_timeout;ph=apex;pm=10012;sm=10530;s=1;fo=1"
+	if got := recorder.headerValue(); got != want {
+		t.Fatalf("headerValue() = %q, want %q", got, want)
+	}
+}
+
+func TestTransportErrorFailoverCarriesClassOnRetryHeader(t *testing.T) {
+	clearTelemetryEnv(t)
+	defer stubSleep(func(context.Context, time.Duration) error { return nil })()
+
+	closed, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closedAddress := closed.Addr().String()
+	if err := closed.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var seen http.Header
+	alias := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer alias.Close()
+
+	c, err := NewClient(Options{APIKey: "k", MaxRetries: intPtr(2), HTTPClient: &http.Client{
+		Transport: newHostRoutingTransport(map[string]string{
+			"api.trustedrouter.com": "http://" + closedAddress,
+			"api.allyrouter.com":    alias.URL,
+		}),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := c.rawRequestWithBaseURLs(context.Background(), "GET", "/models", nil, nil,
+		[]string{DefaultAPIBaseURL, strings.TrimRight(AliasAPIBaseURLs[0], "/")}, true)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	want := regexp.MustCompile(`^v=1;a=1;po=transport_error;pc=connect_refused;ph=apex;pm=[0-9]{1,7};sm=[0-9]{1,7};s=0;fo=1$`)
+	if got := seen.Get("x-tr-client"); !want.MatchString(got) {
+		t.Fatalf("alias attempt x-tr-client = %q, want match for %q", got, want)
+	}
+}
+
+func TestAttemptTimeoutClassifiedOnRetryHeader(t *testing.T) {
+	clearTelemetryEnv(t)
+	defer stubSleep(func(context.Context, time.Duration) error { return nil })()
+
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer slow.Close()
+	var seen http.Header
+	alias := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer alias.Close()
+
+	c, err := NewClient(Options{APIKey: "k", MaxRetries: intPtr(2), HTTPClient: &http.Client{
+		Transport: newHostRoutingTransport(map[string]string{
+			"api.trustedrouter.com": slow.URL,
+			"api.allyrouter.com":    alias.URL,
+		}),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	timeout := 80 * time.Millisecond
+	resp, err := c.rawRequestWithBaseURLs(context.Background(), "GET", "/models", nil, &CallOptions{Timeout: &timeout},
+		[]string{DefaultAPIBaseURL, strings.TrimRight(AliasAPIBaseURLs[0], "/")}, true)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	want := regexp.MustCompile(`^v=1;a=1;po=timeout;pc=read_timeout;ph=apex;pm=[0-9]{1,7};sm=[0-9]{1,7};s=0;fo=1$`)
+	if got := seen.Get("x-tr-client"); !want.MatchString(got) {
+		t.Fatalf("alias attempt x-tr-client = %q, want match for %q", got, want)
+	}
+}
+
+func TestDialTimeoutEmitsConnectTimeoutOnRetryHeader(t *testing.T) {
+	clearTelemetryEnv(t)
+	defer stubSleep(func(context.Context, time.Duration) error { return nil })()
+
+	var seen http.Header
+	alias := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer alias.Close()
+	aliasRoutes := newHostRoutingTransport(map[string]string{"api.allyrouter.com": alias.URL})
+	aliasAddress := strings.TrimPrefix(alias.URL, "http://")
+
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Hostname() == "api.trustedrouter.com" {
+			// A REAL dial whose deadline has already passed: the error is a
+			// genuine *net.OpError{Op: "dial"} that reports Timeout().
+			dialer := net.Dialer{Deadline: time.Now().Add(-time.Second)}
+			conn, err := dialer.DialContext(req.Context(), "tcp", aliasAddress)
+			if err != nil {
+				return nil, err
+			}
+			_ = conn.Close()
+			return nil, errors.New("dial unexpectedly succeeded")
+		}
+		return aliasRoutes.RoundTrip(req)
+	})
+
+	c, err := NewClient(Options{APIKey: "k", MaxRetries: intPtr(2), HTTPClient: &http.Client{Transport: transport}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := c.rawRequestWithBaseURLs(context.Background(), "GET", "/models", nil, nil,
+		[]string{DefaultAPIBaseURL, strings.TrimRight(AliasAPIBaseURLs[0], "/")}, true)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// po=timeout, not the §3.2 prose example's po=transport_error: the
+	// executable trusted-router-py RequestRecorder maps timeout exceptions
+	// to the timeout outcome, and the contract says the modules win.
+	want := regexp.MustCompile(`^v=1;a=1;po=timeout;pc=connect_timeout;ph=apex;pm=[0-9]{1,7};sm=[0-9]{1,7};s=0;fo=1$`)
+	if got := seen.Get("x-tr-client"); !want.MatchString(got) {
+		t.Fatalf("alias attempt x-tr-client = %q, want match for %q", got, want)
+	}
+}
+
+func TestPinnedRetryInPlaceReportsFoZero(t *testing.T) {
+	clearTelemetryEnv(t)
+	defer stubSleep(func(context.Context, time.Duration) error { return nil })()
+
+	var headers []string
+	responses := []*http.Response{
+		jsonResponse(http.StatusServiceUnavailable, map[string]any{"error": "down"}, nil),
+		jsonResponse(http.StatusOK, map[string]any{"ok": true}, nil),
+	}
+	off := false
+	sdk, err := NewClient(Options{APIKey: "k", RegionalFailover: &off, HTTPClient: newRoundTripClient(func(r *http.Request) (*http.Response, error) {
+		headers = append(headers, r.Header.Get("x-tr-client"))
+		resp := responses[0]
+		responses = responses[1:]
+		return resp, nil
+	})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out map[string]any
+	if err := sdk.Request(context.Background(), http.MethodGet, "/models", nil, &out, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(headers) != 2 {
+		t.Fatalf("attempts = %d, want 2", len(headers))
+	}
+	// The failover flag governs WHERE, never WHETHER: the retry stays on the
+	// apex and reports fo=0.
+	want := regexp.MustCompile(`^v=1;a=1;po=http_error;pc=none;ph=apex;pm=[0-9]{1,7};sm=[0-9]{1,7};s=0;fo=0$`)
+	if !want.MatchString(headers[1]) {
+		t.Fatalf("retry x-tr-client = %q, want match for %q", headers[1], want)
+	}
+}
+
+func TestCustomBaseURLSendsNoTelemetryHeader(t *testing.T) {
+	clearTelemetryEnv(t)
+
+	run := func(t *testing.T, telemetry *bool) {
+		t.Helper()
+		var seen http.Header
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			seen = r.Header.Clone()
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		}))
+		defer server.Close()
+		sdk, err := NewClient(Options{APIKey: "k", BaseURL: server.URL, Telemetry: telemetry})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out map[string]any
+		if err := sdk.Request(context.Background(), http.MethodGet, "/models", nil, &out, nil); err != nil {
+			t.Fatal(err)
+		}
+		// A self-hosted gateway is not TrustedRouter's to measure (§3.2):
+		// the request goes through untouched, with no x-tr-client.
+		if got := seen.Values("x-tr-client"); len(got) != 0 {
+			t.Fatalf("x-tr-client sent to a custom base URL: %#v", got)
+		}
+	}
+
+	t.Run("default resolution disables custom bases", func(t *testing.T) {
+		run(t, nil)
+	})
+	t.Run("explicit enable is still suppressed per attempt", func(t *testing.T) {
+		run(t, boolPtr(true))
+	})
+}
+
+func TestControlPlaneCallsCarryNoTelemetryHeader(t *testing.T) {
+	clearTelemetryEnv(t)
+	defer stubSleep(func(context.Context, time.Duration) error { return nil })()
+
+	type controlHit struct {
+		path   string
+		header []string
+	}
+	var hits []controlHit
+	first := true
+	control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits = append(hits, controlHit{path: r.URL.Path, header: r.Header.Values("x-tr-client")})
+		w.Header().Set("Content-Type", "application/json")
+		if first {
+			first = false
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"error":"down"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"data":[]}`))
+	}))
+	defer control.Close()
+
+	// Default base and default control URL: telemetry resolves ON, and the
+	// control host maps to "control", not "custom" — so if a recorder were
+	// active on this plane, every attempt below would carry a header.
+	c, err := NewClient(Options{APIKey: "k", MaxRetries: intPtr(2), HTTPClient: &http.Client{
+		Transport: newHostRoutingTransport(map[string]string{
+			"trustedrouter.com": control.URL,
+		}),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.telemetry {
+		t.Fatal("telemetry should resolve on for the default URLs")
+	}
+	resp, err := c.rawControlRequest(context.Background(), http.MethodGet, "/credits", nil, nil)
+	if err != nil {
+		t.Fatalf("control request: %v", err)
+	}
+	drainAndClose(resp.Body)
+	if _, err := c.Models(context.Background(), nil); err != nil {
+		t.Fatalf("models: %v", err)
+	}
+
+	if len(hits) < 3 {
+		t.Fatalf("control hits = %d, want the 503, its retry, and /models", len(hits))
+	}
+	for _, hit := range hits {
+		if len(hit.header) != 0 {
+			t.Fatalf("control-plane call %s carried x-tr-client %#v", hit.path, hit.header)
+		}
+	}
+}
+
+func TestResolveTelemetryEnabledPrecedence(t *testing.T) {
+	cases := []struct {
+		name     string
+		explicit *bool
+		env      map[string]string
+		base     string
+		control  string
+		want     bool
+	}{
+		{"default on for TrustedRouter hosts", nil, nil, DefaultAPIBaseURL, DefaultControlBaseURL, true},
+		{"alias base defaults on", nil, nil, AliasAPIBaseURLs[1], DefaultControlBaseURL, true},
+		{"region base defaults on", nil, nil, "https://api-us-east4.quillrouter.com/v1", DefaultControlBaseURL, true},
+		{"control subdomain accepted", nil, nil, DefaultAPIBaseURL, "https://eu.trustedrouter.com/v1", true},
+		{"custom base defaults off", nil, nil, "https://gateway.example/v1", DefaultControlBaseURL, false},
+		{"custom control defaults off", nil, nil, DefaultAPIBaseURL, "https://control.example/v1", false},
+		{"non-https control defaults off", nil, nil, DefaultAPIBaseURL, "http://trustedrouter.com/v1", false},
+		{"explicit false beats env enable", boolPtr(false), map[string]string{"TRUSTEDROUTER_TELEMETRY": "1"}, DefaultAPIBaseURL, DefaultControlBaseURL, false},
+		{"explicit true beats env disable", boolPtr(true), map[string]string{"TRUSTEDROUTER_TELEMETRY": "0"}, DefaultAPIBaseURL, DefaultControlBaseURL, true},
+		{"explicit true wins even for custom bases", boolPtr(true), nil, "https://gateway.example/v1", DefaultControlBaseURL, true},
+		{"env 0 disables", nil, map[string]string{"TRUSTEDROUTER_TELEMETRY": "0"}, DefaultAPIBaseURL, DefaultControlBaseURL, false},
+		{"env off disables case-insensitively", nil, map[string]string{"TRUSTEDROUTER_TELEMETRY": " OFF "}, DefaultAPIBaseURL, DefaultControlBaseURL, false},
+		{"env no disables", nil, map[string]string{"TRUSTEDROUTER_TELEMETRY": "no"}, DefaultAPIBaseURL, DefaultControlBaseURL, false},
+		{"env enable beats DO_NOT_TRACK", nil, map[string]string{"TRUSTEDROUTER_TELEMETRY": "yes", "DO_NOT_TRACK": "1"}, DefaultAPIBaseURL, DefaultControlBaseURL, true},
+		{"DO_NOT_TRACK=1 disables", nil, map[string]string{"DO_NOT_TRACK": "1"}, DefaultAPIBaseURL, DefaultControlBaseURL, false},
+		{"DO_NOT_TRACK other values ignored", nil, map[string]string{"DO_NOT_TRACK": "true"}, DefaultAPIBaseURL, DefaultControlBaseURL, true},
+		{"unknown env value falls through to default", nil, map[string]string{"TRUSTEDROUTER_TELEMETRY": "maybe"}, DefaultAPIBaseURL, DefaultControlBaseURL, true},
+		{"env enable does not force custom bases", nil, map[string]string{"TRUSTEDROUTER_TELEMETRY": "1"}, "https://gateway.example/v1", DefaultControlBaseURL, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			getenv := func(key string) string { return tc.env[key] }
+			if got := resolveTelemetryEnabled(tc.explicit, tc.base, tc.control, getenv); got != tc.want {
+				t.Fatalf("resolveTelemetryEnabled() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestTelemetryOptOutSuppressesHeaderOnTheWire(t *testing.T) {
+	request := func(t *testing.T, telemetry *bool) http.Header {
+		t.Helper()
+		var seen http.Header
+		sdk, err := NewClient(Options{APIKey: "k", Telemetry: telemetry, HTTPClient: newRoundTripClient(func(r *http.Request) (*http.Response, error) {
+			seen = r.Header.Clone()
+			return jsonResponse(http.StatusOK, map[string]any{"ok": true}, nil), nil
+		})})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out map[string]any
+		if err := sdk.Request(context.Background(), http.MethodGet, "/models", nil, &out, nil); err != nil {
+			t.Fatal(err)
+		}
+		return seen
+	}
+
+	t.Run("TRUSTEDROUTER_TELEMETRY=0 wins over DO_NOT_TRACK unset", func(t *testing.T) {
+		clearTelemetryEnv(t)
+		t.Setenv("TRUSTEDROUTER_TELEMETRY", "0")
+		if got := request(t, nil).Values("x-tr-client"); len(got) != 0 {
+			t.Fatalf("x-tr-client sent despite TRUSTEDROUTER_TELEMETRY=0: %#v", got)
+		}
+	})
+	t.Run("explicit option false beats env enable", func(t *testing.T) {
+		clearTelemetryEnv(t)
+		t.Setenv("TRUSTEDROUTER_TELEMETRY", "1")
+		if got := request(t, boolPtr(false)).Values("x-tr-client"); len(got) != 0 {
+			t.Fatalf("x-tr-client sent despite Telemetry=false: %#v", got)
+		}
+	})
+	t.Run("DO_NOT_TRACK=1 disables by default", func(t *testing.T) {
+		clearTelemetryEnv(t)
+		t.Setenv("DO_NOT_TRACK", "1")
+		if got := request(t, nil).Values("x-tr-client"); len(got) != 0 {
+			t.Fatalf("x-tr-client sent despite DO_NOT_TRACK=1: %#v", got)
+		}
+	})
+	t.Run("env enable beats DO_NOT_TRACK", func(t *testing.T) {
+		clearTelemetryEnv(t)
+		t.Setenv("TRUSTEDROUTER_TELEMETRY", "1")
+		t.Setenv("DO_NOT_TRACK", "1")
+		if got := request(t, nil).Get("x-tr-client"); got != "v=1;a=0;s=0" {
+			t.Fatalf("x-tr-client = %q, want %q", got, "v=1;a=0;s=0")
+		}
+	})
+	t.Run("opt-out leaves the User-Agent untouched", func(t *testing.T) {
+		clearTelemetryEnv(t)
+		t.Setenv("TRUSTEDROUTER_TELEMETRY", "0")
+		if got := request(t, nil).Get("user-agent"); got != userAgent() {
+			t.Fatalf("user-agent = %q, want %q", got, userAgent())
+		}
+	})
+}
+
+func TestClassifyTransportError(t *testing.T) {
+	classify := func(t *testing.T, err error, want string) {
+		t.Helper()
+		if err == nil {
+			t.Fatal("expected an error to classify")
+		}
+		if got := classifyTransportError(err); got != want {
+			t.Fatalf("classifyTransportError(%v) = %q, want %q", err, got, want)
+		}
+	}
+
+	t.Run("connect refused", func(t *testing.T) {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		address := listener.Addr().String()
+		if err := listener.Close(); err != nil {
+			t.Fatal(err)
+		}
+		_, err = http.Get("http://" + address + "/")
+		classify(t, err, "connect_refused")
+	})
+
+	t.Run("dns failure", func(t *testing.T) {
+		_, err := http.Get("http://telemetry-probe.invalid/")
+		classify(t, err, "dns")
+	})
+
+	t.Run("connect timeout", func(t *testing.T) {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer listener.Close()
+		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+		defer cancel()
+		var dialer net.Dialer
+		_, err = dialer.DialContext(ctx, "tcp", listener.Addr().String())
+		classify(t, err, "connect_timeout")
+	})
+
+	t.Run("read timeout", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			<-r.Context().Done()
+		}))
+		defer server.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = server.Client().Do(req)
+		classify(t, err, "read_timeout")
+	})
+
+	t.Run("tls certificate rejection", func(t *testing.T) {
+		server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+		defer server.Close()
+		// Deliberately NOT server.Client(): the default client does not
+		// trust the test CA, which is exactly the failure to classify.
+		_, err := http.Get(server.URL)
+		classify(t, err, "tls")
+	})
+
+	t.Run("connection reset", func(t *testing.T) {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer listener.Close()
+		go func() {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			reader := bufio.NewReader(conn)
+			for {
+				line, err := reader.ReadString('\n')
+				if err != nil || line == "\r\n" {
+					break
+				}
+			}
+			if tcp, ok := conn.(*net.TCPConn); ok {
+				_ = tcp.SetLinger(0) // close with RST, not FIN
+			}
+			_ = conn.Close()
+		}()
+		_, err = http.Get("http://" + listener.Addr().String() + "/")
+		classify(t, err, "reset")
+	})
+
+	t.Run("malformed response is protocol_error", func(t *testing.T) {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer listener.Close()
+		go func() {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			reader := bufio.NewReader(conn)
+			for {
+				line, err := reader.ReadString('\n')
+				if err != nil || line == "\r\n" {
+					break
+				}
+			}
+			_, _ = conn.Write([]byte("bogus\r\n\r\n"))
+			_ = conn.Close()
+		}()
+		_, err = http.Get("http://" + listener.Addr().String() + "/")
+		classify(t, err, "protocol_error")
+	})
+
+	t.Run("write timeout", func(t *testing.T) {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer listener.Close()
+		conn, err := net.Dial("tcp", listener.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		if err := conn.SetWriteDeadline(time.Now().Add(-time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		payload := make([]byte, 1<<20)
+		var writeErr error
+		for i := 0; i < 64 && writeErr == nil; i++ {
+			_, writeErr = conn.Write(payload)
+		}
+		classify(t, writeErr, "write_timeout")
+	})
+
+	t.Run("unexpected eof is io_error", func(t *testing.T) {
+		classify(t, fmt.Errorf("read body: %w", io.ErrUnexpectedEOF), "io_error")
+	})
+
+	t.Run("unrecognized errors are unknown", func(t *testing.T) {
+		classify(t, errors.New("mystery"), "unknown")
+	})
+}
+
+func TestTelemetryHeaderBoundsAndGrammar(t *testing.T) {
+	worstCase := func() *requestRecorder {
+		start := time.Now()
+		return &requestRecorder{
+			streaming: true,
+			attempts: []telemetryAttempt{{
+				index:      0,
+				host:       "europe_west4",
+				outcome:    "transport_error",
+				errorClass: "connect_timeout",
+				elapsedMS:  3_600_000,
+			}},
+			failoverUsed: true,
+			firstStarted: start,
+			attemptStart: start.Add(2 * time.Hour), // clamped to 3600000
+			currentHost:  "ally",
+			currentIndex: 99,
+			begun:        true,
+		}
+	}
+
+	t.Run("worst case stays within 160 bytes", func(t *testing.T) {
+		want := "v=1;a=99;po=transport_error;pc=connect_timeout;ph=europe_west4;pm=3600000;sm=3600000;s=1;fo=1"
+		got := worstCase().headerValue()
+		if got != want {
+			t.Fatalf("headerValue() = %q, want %q", got, want)
+		}
+		if len(got) > 160 {
+			t.Fatalf("header is %d bytes, contract caps it at 160", len(got))
+		}
+		valueRe := regexp.MustCompile(`^[a-z0-9_]{1,24}$`)
+		for _, part := range strings.Split(got, ";") {
+			_, value, ok := strings.Cut(part, "=")
+			if !ok || !valueRe.MatchString(value) {
+				t.Fatalf("segment %q violates the value grammar", part)
+			}
+		}
+	})
+
+	t.Run("attempt index above 99 sends nothing", func(t *testing.T) {
+		recorder := worstCase()
+		recorder.currentIndex = 100
+		if got := recorder.headerValue(); got != "" {
+			t.Fatalf("headerValue() = %q, want suppression above a=99", got)
+		}
+	})
+
+	t.Run("out-of-grammar value sends nothing", func(t *testing.T) {
+		recorder := worstCase()
+		recorder.attempts[0].errorClass = "Not Valid!"
+		if got := recorder.headerValue(); got != "" {
+			t.Fatalf("headerValue() = %q, want suppression", got)
+		}
+	})
+
+	t.Run("oversized header sends nothing", func(t *testing.T) {
+		recorder := worstCase()
+		long := strings.Repeat("a", 60)
+		recorder.attempts[0].outcome = long
+		recorder.attempts[0].errorClass = long
+		recorder.attempts[0].host = long
+		if got := recorder.headerValue(); got != "" {
+			t.Fatalf("headerValue() = %q, want suppression", got)
+		}
+	})
+
+	t.Run("durations clamp to 0..3600000", func(t *testing.T) {
+		if got := clampDurationMS(-time.Second); got != 0 {
+			t.Fatalf("clampDurationMS(-1s) = %d, want 0", got)
+		}
+		if got := clampDurationMS(48 * time.Hour); got != 3_600_000 {
+			t.Fatalf("clampDurationMS(48h) = %d, want 3600000", got)
+		}
+	})
+}
+
+func TestHostEnumMapping(t *testing.T) {
+	cases := map[string]string{
+		DefaultAPIBaseURL:                                        "apex",
+		"https://api.trustedrouter.com":                          "apex",
+		"https://api.trustedrouter.com:8443/v1":                  "apex", // ports are ignored, as in trusted-router-py
+		AliasAPIBaseURLs[0]:                                      "ally",
+		AliasAPIBaseURLs[1]:                                      "uptime",
+		"https://api-us-central1.quillrouter.com/v1":             "us_central1",
+		"https://api-us-east4.quillrouter.com/v1":                "us_east4",
+		"https://api-europe-west4.quillrouter.com/v1":            "europe_west4",
+		DefaultControlBaseURL:                                    "control",
+		"https://trust.trustedrouter.com/trust/gcp-release.json": "control",
+		"http://api.trustedrouter.com/v1":                        "custom", // scheme matters
+		"https://gateway.example/v1":                             "custom",
+		"http://127.0.0.1:8080":                                  "custom",
+		"":                                                       "custom",
+		"not a url":                                              "custom",
+	}
+	for input, want := range cases {
+		if got := hostEnum(input); got != want {
+			t.Errorf("hostEnum(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
+func TestTelemetryParityConstants(t *testing.T) {
+	// §6.4: every SDK pins the beacon path, the schema version, and the
+	// closed enum vocabulary, so the later beacon PR cannot drift from the
+	// server-side contract.
+	if telemetrySchemaVersion != 1 {
+		t.Fatalf("telemetrySchemaVersion = %d, want 1", telemetrySchemaVersion)
+	}
+	if telemetryEventsPath != "/client-events" {
+		t.Fatalf("telemetryEventsPath = %q, want %q", telemetryEventsPath, "/client-events")
+	}
+	wantHosts := []string{"apex", "ally", "uptime", "us_central1", "us_east4", "europe_west4", "control", "custom"}
+	if !reflect.DeepEqual(telemetryHosts, wantHosts) {
+		t.Errorf("telemetryHosts = %#v, want %#v", telemetryHosts, wantHosts)
+	}
+	wantEndpoints := []string{"chat_completions", "messages", "responses", "embeddings", "images", "videos", "models", "fusion", "control_other", "inference_other"}
+	if !reflect.DeepEqual(telemetryEndpoints, wantEndpoints) {
+		t.Errorf("telemetryEndpoints = %#v, want %#v", telemetryEndpoints, wantEndpoints)
+	}
+	wantOutcomes := []string{"ok", "http_error", "transport_error", "timeout", "stream_broken", "aborted"}
+	if !reflect.DeepEqual(telemetryOutcomes, wantOutcomes) {
+		t.Errorf("telemetryOutcomes = %#v, want %#v", telemetryOutcomes, wantOutcomes)
+	}
+	wantErrorClasses := []string{"dns", "tls", "connect_refused", "connect_timeout", "connect_error", "read_timeout", "write_timeout", "pool_timeout", "protocol_error", "reset", "io_error", "proxy_error", "stream_stalled", "unknown"}
+	if !reflect.DeepEqual(telemetryErrorClasses, wantErrorClasses) {
+		t.Errorf("telemetryErrorClasses = %#v, want %#v", telemetryErrorClasses, wantErrorClasses)
+	}
+}
+
+func TestUserAgentMatchesTelemetryContractGrammar(t *testing.T) {
+	// §3.1: `trusted-router-go/SEMVER( runtime/ver)?`. The enclave derives
+	// sdk, sdk_version, and runtime from this exact shape; an extra token
+	// (the old trailing GOOS) makes the whole identity unparseable.
+	grammar := regexp.MustCompile(
+		`^trusted-router-go/(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)` +
+			`(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?` +
+			`( [a-z]{1,10}/[0-9A-Za-z.+-]{1,24})?$`)
+	got := userAgent()
+	if !grammar.MatchString(got) {
+		t.Fatalf("userAgent() = %q does not match the §3.1 grammar", got)
+	}
+	if !strings.HasPrefix(got, "trusted-router-go/"+Version) {
+		t.Fatalf("userAgent() = %q does not carry Version %q", got, Version)
+	}
+}

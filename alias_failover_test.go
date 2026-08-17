@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // The domain is a single point of failure above the whole deployment. These
@@ -39,28 +40,41 @@ func TestACustomBaseURLIsNeverRedirectedToAPublicAlias(t *testing.T) {
 }
 
 func TestA503AdvancesToTheNextCandidate(t *testing.T) {
+	t.Setenv("TRUSTEDROUTER_TELEMETRY", "")
+	t.Setenv("DO_NOT_TRACK", "")
+	defer stubSleep(func(context.Context, time.Duration) error { return nil })()
 	var seen []string
+	var headers []string
 	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seen = append(seen, "primary")
+		headers = append(headers, r.Header.Get("x-tr-client"))
 		w.WriteHeader(http.StatusServiceUnavailable)
 		_, _ = w.Write([]byte(`{"error":"down"}`))
 	}))
 	defer primary.Close()
 	alias := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seen = append(seen, "alias")
+		headers = append(headers, r.Header.Get("x-tr-client"))
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	}))
 	defer alias.Close()
 
-	c, err := NewClient(Options{APIKey: "k", BaseURL: primary.URL, MaxRetries: intPtr(2)})
+	// A custom BaseURL never gains aliases, so inject the pair directly: this
+	// test is about the ADVANCE, which is the half that never existed. The
+	// candidates keep their real domains — routed to the local servers by
+	// host — so the telemetry channel sees apex and ally, not "custom".
+	c, err := NewClient(Options{APIKey: "k", MaxRetries: intPtr(2), HTTPClient: &http.Client{
+		Transport: newHostRoutingTransport(map[string]string{
+			"api.trustedrouter.com": primary.URL,
+			"api.allyrouter.com":    alias.URL,
+		}),
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	// A custom BaseURL never gains aliases, so inject the pair directly: this
-	// test is about the ADVANCE, which is the half that never existed.
 	resp, err := c.rawRequestWithBaseURLs(context.Background(), "GET", "/models", nil, nil,
-		[]string{primary.URL, alias.URL}, true)
+		[]string{DefaultAPIBaseURL, strings.TrimRight(AliasAPIBaseURLs[0], "/")}, true)
 	if err != nil {
 		t.Fatalf("request: %v", err)
 	}
@@ -72,6 +86,22 @@ func TestA503AdvancesToTheNextCandidate(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200 from the alias", resp.StatusCode)
 	}
+
+	// Telemetry header channel (contract v1 §3.2): the first attempt is the
+	// bare vector, and the alias attempt describes the failed apex attempt.
+	if headers[0] != "v=1;a=0;s=0" {
+		t.Fatalf("attempt 0 x-tr-client = %q, want %q", headers[0], "v=1;a=0;s=0")
+	}
+	fields := parseTelemetryHeader(t, headers[1])
+	for key, want := range map[string]string{
+		"v": "1", "a": "1", "po": "http_error", "pc": "none", "ph": "apex", "s": "0", "fo": "1",
+	} {
+		if fields[key] != want {
+			t.Errorf("alias attempt %s = %q, want %q (header %q)", key, fields[key], want, headers[1])
+		}
+	}
+	requireBoundedMs(t, fields, "pm")
+	requireBoundedMs(t, fields, "sm")
 }
 
 func TestA500DoesNotAdvanceToAnotherDomain(t *testing.T) {
