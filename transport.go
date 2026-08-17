@@ -243,6 +243,9 @@ func (c *Client) absoluteRequest(ctx context.Context, method, requestURL string)
 		req.Header.Set(key, value)
 	}
 	req.Header.Set("user-agent", userAgent())
+	// x-tr-client is SDK-reserved (§3.2): these credential-free one-shot
+	// fetches never carry it, even a stale caller-configured value.
+	req.Header.Del("x-tr-client")
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		cancel()
@@ -322,15 +325,13 @@ func (c *Client) newHTTPRequest(ctx context.Context, method, url string, bodyByt
 		req.Header.Set("authorization", "Bearer "+apiKey)
 	}
 
-	// x-tr-client is assembled here and only here (contract §6.1). While a
-	// recorder is active it owns the header outright — a stale
-	// caller-supplied value is removed even when this attempt sends
-	// nothing. Without a recorder (opt-out, control plane) caller headers
-	// pass through untouched. Both halves mirror trusted-router-py
-	// _set_recorder_header, which is likewise applied only when a recorder
-	// exists.
+	// x-tr-client is assembled here and only here (contract §6.1), and the
+	// header name is SDK-reserved across all six TrustedRouter SDKs: any
+	// caller-supplied value is removed on EVERY path — opt-out, custom
+	// bases, and control-plane calls included — and the SDK's own value is
+	// set only while telemetry is actively recording (§3.2, §6.3).
+	req.Header.Del("x-tr-client")
 	if recorder != nil {
-		req.Header.Del("x-tr-client")
 		if value := recorder.headerValue(); value != "" {
 			req.Header.Set("x-tr-client", value)
 		}

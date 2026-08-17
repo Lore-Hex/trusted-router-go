@@ -125,24 +125,21 @@ func TestXTRClientHeaderOnAttemptZero(t *testing.T) {
 }
 
 func TestXTRClientRetryVectorMatchesContractExample(t *testing.T) {
-	// The contract's §3.2 worked example, byte for byte: a retry after a
-	// connect timeout on the apex that moved to an alias. The durations are
-	// timing-dependent on the wire, so the recorder state is laid out
-	// directly and the REAL assembler renders it.
-	//
-	// Note the prose example pairs po=transport_error with pc=connect_timeout,
-	// but trusted-router-py's executable RequestRecorder emits po=timeout for
-	// every timeout exception — and the contract's preamble says the modules
-	// win over the document. This vector therefore pins the ASSEMBLER's
-	// rendering of the documented state; the live outcome for a real dial
-	// timeout is pinned by TestDialTimeoutEmitsConnectTimeoutOnRetryHeader.
+	// ASSEMBLER-ONLY golden vector: the contract's §3.2 worked example
+	// (as corrected upstream in quill-router#645 to po=timeout, matching
+	// the executable trusted-router-py reference), byte for byte — a retry
+	// after a connect timeout on the apex that moved to an alias. The
+	// engine produces exactly this state live, but its pm/sm digits are
+	// timing-dependent, so the state is laid out directly here and the
+	// REAL assembler renders it; the engine path for the same failure is
+	// pinned by TestDialTimeoutEmitsConnectTimeoutOnRetryHeader.
 	start := time.Now()
 	recorder := &requestRecorder{
 		streaming: true,
 		attempts: []telemetryAttempt{{
 			index:      0,
 			host:       "apex",
-			outcome:    "transport_error",
+			outcome:    "timeout",
 			errorClass: "connect_timeout",
 			elapsedMS:  10012,
 			moved:      true,
@@ -154,7 +151,7 @@ func TestXTRClientRetryVectorMatchesContractExample(t *testing.T) {
 		currentIndex: 1,
 		begun:        true,
 	}
-	want := "v=1;a=1;po=transport_error;pc=connect_timeout;ph=apex;pm=10012;sm=10530;s=1;fo=1"
+	want := "v=1;a=1;po=timeout;pc=connect_timeout;ph=apex;pm=10012;sm=10530;s=1;fo=1"
 	if got := recorder.headerValue(); got != want {
 		t.Fatalf("headerValue() = %q, want %q", got, want)
 	}
@@ -282,13 +279,316 @@ func TestDialTimeoutEmitsConnectTimeoutOnRetryHeader(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	// po=timeout, not the §3.2 prose example's po=transport_error: the
-	// executable trusted-router-py RequestRecorder maps timeout exceptions
-	// to the timeout outcome, and the contract says the modules win.
+	// po=timeout, matching the executable trusted-router-py reference and
+	// the corrected §3.2 example (quill-router#645).
 	want := regexp.MustCompile(`^v=1;a=1;po=timeout;pc=connect_timeout;ph=apex;pm=[0-9]{1,7};sm=[0-9]{1,7};s=0;fo=1$`)
 	if got := seen.Get("x-tr-client"); !want.MatchString(got) {
 		t.Fatalf("alias attempt x-tr-client = %q, want match for %q", got, want)
 	}
+}
+
+func TestProxyFailureEmitsProxyErrorOnRetryHeader(t *testing.T) {
+	clearTelemetryEnv(t)
+	defer stubSleep(func(context.Context, time.Duration) error { return nil })()
+
+	// A refusing local port standing in for a dead HTTP proxy: net/http
+	// wraps the failure as *net.OpError{Op: "proxyconnect"} around the
+	// refused dial, and the refused inner error must NOT win (§8: a broken
+	// user proxy is not a TrustedRouter fault).
+	deadProxy, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadProxyURL, err := url.Parse("http://" + deadProxy.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := deadProxy.Close(); err != nil {
+		t.Fatal(err)
+	}
+	proxied := &http.Transport{Proxy: http.ProxyURL(deadProxyURL)}
+
+	var seen http.Header
+	alias := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer alias.Close()
+	aliasRoutes := newHostRoutingTransport(map[string]string{"api.allyrouter.com": alias.URL})
+
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Hostname() == "api.trustedrouter.com" {
+			return proxied.RoundTrip(req)
+		}
+		return aliasRoutes.RoundTrip(req)
+	})
+
+	c, err := NewClient(Options{APIKey: "k", MaxRetries: intPtr(2), HTTPClient: &http.Client{Transport: transport}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := c.rawRequestWithBaseURLs(context.Background(), "GET", "/models", nil, nil,
+		[]string{DefaultAPIBaseURL, strings.TrimRight(AliasAPIBaseURLs[0], "/")}, true)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	want := regexp.MustCompile(`^v=1;a=1;po=transport_error;pc=proxy_error;ph=apex;pm=[0-9]{1,7};sm=[0-9]{1,7};s=0;fo=1$`)
+	if got := seen.Get("x-tr-client"); !want.MatchString(got) {
+		t.Fatalf("alias attempt x-tr-client = %q, want match for %q", got, want)
+	}
+}
+
+func TestTLSHandshakeTimeoutEmitsConnectTimeoutOnRetryHeader(t *testing.T) {
+	clearTelemetryEnv(t)
+	defer stubSleep(func(context.Context, time.Duration) error { return nil })()
+
+	// A plain-TCP listener that accepts and swallows the ClientHello
+	// without ever answering: the handshake stalls until net/http's
+	// TLSHandshakeTimeout fires. Ruling: TLS establishment is connect
+	// phase, as httpx folds TCP+TLS setup into ConnectTimeout.
+	stall, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stall.Close()
+	go func() {
+		for {
+			conn, err := stall.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				_, _ = io.Copy(io.Discard, conn)
+				_ = conn.Close()
+			}()
+		}
+	}()
+	stalled := &http.Transport{TLSHandshakeTimeout: 50 * time.Millisecond}
+	stallAddress := stall.Addr().String()
+
+	var seen http.Header
+	alias := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer alias.Close()
+	aliasRoutes := newHostRoutingTransport(map[string]string{"api.allyrouter.com": alias.URL})
+
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Hostname() == "api.trustedrouter.com" {
+			clone := req.Clone(req.Context())
+			clone.URL.Scheme = "https"
+			clone.URL.Host = stallAddress
+			clone.Host = ""
+			return stalled.RoundTrip(clone)
+		}
+		return aliasRoutes.RoundTrip(req)
+	})
+
+	c, err := NewClient(Options{APIKey: "k", MaxRetries: intPtr(2), HTTPClient: &http.Client{Transport: transport}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := c.rawRequestWithBaseURLs(context.Background(), "GET", "/models", nil, nil,
+		[]string{DefaultAPIBaseURL, strings.TrimRight(AliasAPIBaseURLs[0], "/")}, true)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	want := regexp.MustCompile(`^v=1;a=1;po=timeout;pc=connect_timeout;ph=apex;pm=[0-9]{1,7};sm=[0-9]{1,7};s=0;fo=1$`)
+	if got := seen.Get("x-tr-client"); !want.MatchString(got) {
+		t.Fatalf("alias attempt x-tr-client = %q, want match for %q", got, want)
+	}
+}
+
+// hostileError panics in Error(): the shape of an instrumentation wrapper's
+// bug arriving through a caller-injected http.Client.
+type hostileError struct{}
+
+func (hostileError) Error() string { panic("hostile Error method") }
+
+func TestHostileErrorValuesCannotFailTheRequest(t *testing.T) {
+	clearTelemetryEnv(t)
+	defer stubSleep(func(context.Context, time.Duration) error { return nil })()
+
+	calls := 0
+	sdk, err := NewClient(Options{APIKey: "k", HTTPClient: newRoundTripClient(func(r *http.Request) (*http.Response, error) {
+		calls++
+		if calls == 1 {
+			return nil, hostileError{}
+		}
+		return jsonResponse(http.StatusOK, map[string]any{"ok": true}, nil), nil
+	})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out map[string]any
+	// §2.2: telemetry classification walks the hostile error and must
+	// swallow the panic; the retry then succeeds exactly as it did before
+	// telemetry existed.
+	if err := sdk.Request(context.Background(), http.MethodGet, "/models", nil, &out, nil); err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("attempts = %d, want 2", calls)
+	}
+}
+
+func TestForcedRetryOfSuccessReportsPoNone(t *testing.T) {
+	clearTelemetryEnv(t)
+	defer stubSleep(func(context.Context, time.Duration) error { return nil })()
+
+	var headers []string
+	verdictTrue := http.Header{}
+	verdictTrue.Set("X-Should-Retry", "true")
+	responses := []*http.Response{
+		jsonResponse(http.StatusOK, map[string]any{"ok": true}, verdictTrue),
+		jsonResponse(http.StatusOK, map[string]any{"ok": true}, nil),
+	}
+	sdk, err := NewClient(Options{APIKey: "k", HTTPClient: newRoundTripClient(func(r *http.Request) (*http.Response, error) {
+		headers = append(headers, r.Header.Get("x-tr-client"))
+		resp := responses[0]
+		responses = responses[1:]
+		return resp, nil
+	})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out map[string]any
+	if err := sdk.Request(context.Background(), http.MethodGet, "/models", nil, &out, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(headers) != 2 {
+		t.Fatalf("attempts = %d, want 2", len(headers))
+	}
+	// A forced x-should-retry retry of a 2xx records outcome "ok", which is
+	// outside §3.2's po vocabulary; the ruling maps it to po=none;pc=none
+	// with every other key intact rather than emitting a header the
+	// enclave would drop whole.
+	want := regexp.MustCompile(`^v=1;a=1;po=none;pc=none;ph=apex;pm=[0-9]{1,7};sm=[0-9]{1,7};s=0;fo=0$`)
+	if !want.MatchString(headers[1]) {
+		t.Fatalf("retry x-tr-client = %q, want match for %q", headers[1], want)
+	}
+}
+
+func TestReservedHeaderStrippedOnEveryPath(t *testing.T) {
+	stale := map[string]string{"x-tr-client": "v=1;a=9;s=0"}
+
+	t.Run("opt-out", func(t *testing.T) {
+		clearTelemetryEnv(t)
+		var seen http.Header
+		sdk, err := NewClient(Options{APIKey: "k", Telemetry: boolPtr(false), Headers: stale,
+			HTTPClient: newRoundTripClient(func(r *http.Request) (*http.Response, error) {
+				seen = r.Header.Clone()
+				return jsonResponse(http.StatusOK, map[string]any{"ok": true}, nil), nil
+			})})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out map[string]any
+		if err := sdk.Request(context.Background(), http.MethodGet, "/models", nil, &out, &CallOptions{
+			ExtraHeaders: map[string]string{"X-TR-Client": "v=1;a=8;s=1"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if got := seen.Values("x-tr-client"); len(got) != 0 {
+			t.Fatalf("stale x-tr-client survived opt-out: %#v", got)
+		}
+	})
+
+	t.Run("custom base", func(t *testing.T) {
+		clearTelemetryEnv(t)
+		var seen http.Header
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			seen = r.Header.Clone()
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		}))
+		defer server.Close()
+		sdk, err := NewClient(Options{APIKey: "k", BaseURL: server.URL, Headers: stale})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out map[string]any
+		if err := sdk.Request(context.Background(), http.MethodGet, "/models", nil, &out, nil); err != nil {
+			t.Fatal(err)
+		}
+		if got := seen.Values("x-tr-client"); len(got) != 0 {
+			t.Fatalf("stale x-tr-client reached a custom base: %#v", got)
+		}
+	})
+
+	t.Run("control plane", func(t *testing.T) {
+		clearTelemetryEnv(t)
+		var seen http.Header
+		control := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			seen = r.Header.Clone()
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":[]}`))
+		}))
+		defer control.Close()
+		c, err := NewClient(Options{APIKey: "k", Headers: stale, HTTPClient: &http.Client{
+			Transport: newHostRoutingTransport(map[string]string{"trustedrouter.com": control.URL}),
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := c.rawControlRequest(context.Background(), http.MethodGet, "/credits", nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		drainAndClose(resp.Body)
+		if got := seen.Values("x-tr-client"); len(got) != 0 {
+			t.Fatalf("stale x-tr-client reached the control plane: %#v", got)
+		}
+	})
+
+	t.Run("absolute request", func(t *testing.T) {
+		clearTelemetryEnv(t)
+		var seen http.Header
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			seen = r.Header.Clone()
+			_, _ = w.Write([]byte(`{}`))
+		}))
+		defer server.Close()
+		c, err := NewClient(Options{APIKey: "k", Headers: stale})
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := c.absoluteRequest(context.Background(), http.MethodGet, server.URL+"/status.json")
+		if err != nil {
+			t.Fatal(err)
+		}
+		drainAndClose(resp.Body)
+		if got := seen.Values("x-tr-client"); len(got) != 0 {
+			t.Fatalf("stale x-tr-client survived absoluteRequest: %#v", got)
+		}
+	})
+
+	t.Run("recording replaces a stale value", func(t *testing.T) {
+		clearTelemetryEnv(t)
+		var seen http.Header
+		sdk, err := NewClient(Options{APIKey: "k", Headers: stale,
+			HTTPClient: newRoundTripClient(func(r *http.Request) (*http.Response, error) {
+				seen = r.Header.Clone()
+				return jsonResponse(http.StatusOK, map[string]any{"ok": true}, nil), nil
+			})})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out map[string]any
+		if err := sdk.Request(context.Background(), http.MethodGet, "/models", nil, &out, nil); err != nil {
+			t.Fatal(err)
+		}
+		if got := seen.Values("x-tr-client"); len(got) != 1 || got[0] != "v=1;a=0;s=0" {
+			t.Fatalf("x-tr-client = %#v, want the SDK's own [%q]", got, "v=1;a=0;s=0")
+		}
+	})
 }
 
 func TestPinnedRetryInPlaceReportsFoZero(t *testing.T) {
@@ -535,7 +835,10 @@ func TestClassifyTransportError(t *testing.T) {
 	})
 
 	t.Run("dns failure", func(t *testing.T) {
-		_, err := http.Get("http://telemetry-probe.invalid/")
+		// A direct dial rather than http.Get: the plain-TCP path cannot be
+		// diverted by HTTP_PROXY-style process configuration, so the
+		// failure is a real resolver *net.DNSError on any machine.
+		_, err := net.Dial("tcp", "telemetry-probe.invalid:80")
 		classify(t, err, "dns")
 	})
 

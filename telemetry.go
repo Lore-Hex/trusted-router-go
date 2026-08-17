@@ -209,7 +209,11 @@ func classifyTransportError(err error) string {
 	}
 	if errors.Is(err, context.DeadlineExceeded) || isNetTimeoutError(err) {
 		switch {
-		case isDialError(err):
+		case isDialError(err), isProxyConnectError(err), isTLSHandshakeTimeout(err):
+			// TCP dial, proxy CONNECT, and the TLS handshake are all
+			// connection establishment: httpx folds them into
+			// ConnectTimeout (checked before ProxyError in the py
+			// reference), so the Go classes mirror that.
 			return "connect_timeout"
 		case isWriteOpError(err):
 			// trusted-router-py maps httpx.WriteTimeout to write_timeout;
@@ -218,6 +222,14 @@ func classifyTransportError(err error) string {
 		default:
 			return "read_timeout"
 		}
+	}
+	if isProxyConnectError(err) {
+		// Checked BEFORE dns/refused/reset: net/http wraps the proxy dial
+		// failure around those same errors (*net.OpError{Op:
+		// "proxyconnect"}), and a user's broken proxy must not be
+		// attributed to TrustedRouter — proxy_error is excluded from the
+		// §8 availability denominator while connect_refused counts.
+		return "proxy_error"
 	}
 	var dnsErr *net.DNSError
 	if errors.As(err, &dnsErr) {
@@ -257,6 +269,20 @@ func isDialError(err error) bool {
 func isWriteOpError(err error) bool {
 	var opErr *net.OpError
 	return errors.As(err, &opErr) && opErr.Op == "write"
+}
+
+// isProxyConnectError recognizes net/http's proxy-dial wrapper
+// (*net.OpError{Op: "proxyconnect"}); errors.As surfaces the outermost
+// OpError, so the wrapper is seen before the dial error inside it.
+func isProxyConnectError(err error) bool {
+	var opErr *net.OpError
+	return errors.As(err, &opErr) && opErr.Op == "proxyconnect"
+}
+
+// isTLSHandshakeTimeout recognizes net/http's unexported
+// tlsHandshakeTimeoutError, which is reachable only by its message.
+func isTLSHandshakeTimeout(err error) bool {
+	return strings.Contains(err.Error(), "TLS handshake timeout")
 }
 
 func isReadWriteError(err error) bool {
@@ -337,11 +363,21 @@ func newRequestRecorder(streaming bool) *requestRecorder {
 	return &requestRecorder{streaming: streaming}
 }
 
+// recoverTelemetryPanic is deferred by every recorder callback: telemetry
+// runs synchronously on the money path, and a hostile error value — an
+// Error(), Unwrap(), or As() that panics, reachable through a
+// caller-injected http.Client — must cost at most a missing telemetry
+// record, never the user's request (§2.2).
+func recoverTelemetryPanic() {
+	_ = recover()
+}
+
 // beginAttempt marks the start of the attempt about to be sent to baseURL.
 func (r *requestRecorder) beginAttempt(baseURL string) {
 	if r == nil {
 		return
 	}
+	defer recoverTelemetryPanic()
 	now := time.Now()
 	if !r.begun {
 		r.firstStarted = now
@@ -357,6 +393,7 @@ func (r *requestRecorder) onResponse(statusCode int) {
 	if r == nil || !r.begun {
 		return
 	}
+	defer recoverTelemetryPanic()
 	outcome := "http_error"
 	if statusCode < 400 {
 		outcome = "ok"
@@ -376,6 +413,7 @@ func (r *requestRecorder) onTransportError(err error, openTimedOut bool) {
 	if r == nil || !r.begun {
 		return
 	}
+	defer recoverTelemetryPanic()
 	var outcome, errorClass string
 	if openTimedOut {
 		outcome = "timeout"
@@ -410,6 +448,7 @@ func (r *requestRecorder) onMoved() {
 	if r == nil || len(r.attempts) == 0 {
 		return
 	}
+	defer recoverTelemetryPanic()
 	r.attempts[len(r.attempts)-1].moved = true
 	r.failoverUsed = true
 }
@@ -451,12 +490,26 @@ func (r *requestRecorder) headerValue() (value string) {
 			return ""
 		}
 		previous := r.attempts[len(r.attempts)-1]
+		outcome := previous.outcome
 		errorClass := previous.errorClass
 		if errorClass == "" {
 			errorClass = "none"
 		}
+		switch outcome {
+		case "http_error", "transport_error", "timeout", "stream_broken":
+		default:
+			// §3.2's po vocabulary is none|http_error|transport_error|
+			// timeout|stream_broken. A forced x-should-retry retry of a
+			// sub-400 response records outcome "ok", which is outside it —
+			// sending it would get the whole header dropped by the
+			// enclave. Cross-SDK ruling: report po=none;pc=none and keep
+			// the remaining keys. (trusted-router-py currently emits
+			// po=ok here — an upstream bug deliberately not replicated.)
+			outcome = "none"
+			errorClass = "none"
+		}
 		parts = append(parts,
-			"po="+previous.outcome,
+			"po="+outcome,
 			"pc="+errorClass,
 			"ph="+previous.host,
 			"pm="+strconv.FormatInt(previous.elapsedMS, 10),
