@@ -3,37 +3,106 @@ package trustedrouter
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
-// panickingTransportError is the shape of an instrumentation wrapper's bug
+// The hostile values below are the shape of an instrumentation wrapper's bug
 // arriving through a caller-injected http.Client: an error value whose
-// Error method is arbitrary code that panics.
+// rendering is arbitrary code.
 //
-// Reachability note, established while writing this test: fmt.Sprintf
-// RECOVERS panics raised by an operand's Error method and renders a
-// "%!s(PANIC=...)" marker instead, so the old
-// fmt.Sprintf-based transportRetryError never crashed — it silently leaned
-// on that fmt implementation detail and produced marker garbage in the
-// message. The hazard becomes a real process crash the moment the raw
-// value is flattened with a direct .Error() call (as the telemetry branch
-// does during error classification, guarded there). safeErrorMessage makes
-// the SDK's single flattening point immune either way and bounds the
-// message.
+// Reachability, established empirically rather than assumed (the numbers
+// each test asserts follow from it):
+//
+//   - fmt RECOVERS a panic raised by an operand's Error method and renders a
+//     "%!s(PANIC=...)" marker. So a plain panicking Error method never
+//     crashed the pre-fix fmt.Sprintf implementation, and it does not crash
+//     the current one either.
+//   - fmt does NOT survive a panic whose VALUE is itself an error with a
+//     panicking Error method: catchPanic formats the panic value, hits the
+//     second panic while already panicking, and re-panics out of
+//     fmt.Sprintf. That is a real process crash, and it reaches the SDK
+//     unwrapped on the mid-stream body path — see
+//     TestNestedHostileMidStreamErrorSurfacesPlaceholder, which is the test
+//     that fails (crashes) without safeErrorMessage's recover guard.
+//   - http.Client.Do wraps a RoundTripper error in *url.Error, whose own
+//     Error method renders the inner value through fmt. That extra fmt
+//     frame is why the exhaustion path sees a marker string rather than a
+//     panic for the plain hostile value.
 type panickingTransportError struct{}
 
 func (panickingTransportError) Error() string { panic("hostile Error method") }
 
-// TestHostileErrorAtExhaustionSurfacesSDKError drives the real engine loop
-// to retry exhaustion on an error whose Error() panics. The caller must
-// receive the SDK's typed, bounded error — never a panic — regardless of
-// how the flattening is implemented. The telemetry branch's
-// TestHostileErrorValuesCannotFailTheRequest covers the same hostile value
-// on the retry path; this test covers exhaustion.
+// nestedPanickingTransportError panics WITH an error whose Error method
+// panics in turn — the shape fmt cannot recover from.
+type nestedPanickingTransportError struct{}
+
+func (nestedPanickingTransportError) Error() string { panic(panickingTransportError{}) }
+
+// redactingError renders one thing through fmt.Formatter and another through
+// Error(): the shape that makes a direct .Error() call a leak rather than a
+// mere formatting change.
+type redactingError struct{}
+
+func (redactingError) Error() string { return "authorization=Bearer sk-live-SECRET" }
+
+func (redactingError) Format(f fmt.State, verb rune) {
+	_, _ = io.WriteString(f, "authorization=[redacted]")
+}
+
+// hostileBody is a response body whose Read fails with the supplied error.
+// Mid-stream body errors reach transportRetryError UNWRAPPED — no url.Error
+// frame, no extra fmt shielding — so this is the path where the guard and
+// the bound are load-bearing.
+type hostileBody struct{ err error }
+
+func (b hostileBody) Read([]byte) (int, error) { return 0, b.err }
+func (b hostileBody) Close() error             { return nil }
+
+func streamErrorFor(t *testing.T, bodyErr error) *InternalError {
+	t.Helper()
+	sdk, err := NewClient(Options{APIKey: "k", HTTPClient: newRoundTripClient(func(r *http.Request) (*http.Response, error) {
+		resp := textResponse(http.StatusOK, "", nil)
+		resp.Header.Set("Content-Type", "text/event-stream")
+		resp.Body = io.NopCloser(hostileBody{err: bodyErr})
+		return resp, nil
+	})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var streamErr error
+	for _, err := range sdk.ChatCompletionsChunks(context.Background(), ChatRequest{
+		Messages: []map[string]any{{"role": "user", "content": "hi"}},
+	}) {
+		if err != nil {
+			streamErr = err
+			break
+		}
+	}
+	if streamErr == nil {
+		t.Fatal("expected the broken stream to surface an error")
+	}
+	var internal *InternalError
+	if !errors.As(streamErr, &internal) {
+		t.Fatalf("err = %T, want *InternalError", streamErr)
+	}
+	return internal
+}
+
+// TestHostileErrorAtExhaustionSurfacesSDKError drives the real engine loop to
+// retry exhaustion on an error whose Error method panics. This one is
+// REGRESSION coverage, not the proof of the fix: because http.Client.Do's
+// *url.Error wrapper renders the value through fmt, this case passed on the
+// pre-fix implementation too. It is kept because it pins the engine
+// behaviour around the flattening point — typed error, status, attempt
+// count, bounded message — for every future refactor of it. The proof that
+// the guard does something lives in
+// TestNestedHostileMidStreamErrorSurfacesPlaceholder.
 func TestHostileErrorAtExhaustionSurfacesSDKError(t *testing.T) {
 	defer stubSleep(func(context.Context, time.Duration) error { return nil })()
 
@@ -58,57 +127,67 @@ func TestHostileErrorAtExhaustionSurfacesSDKError(t *testing.T) {
 	if internal.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want %d", internal.StatusCode, http.StatusServiceUnavailable)
 	}
-	if !strings.HasPrefix(internal.Message, "TrustedRouter endpoint unavailable: ") {
+	if !strings.HasPrefix(internal.Message, transportErrorMessagePrefix) {
 		t.Fatalf("message = %q, want the endpoint-unavailable prefix", internal.Message)
 	}
-	// http.Client wraps the transport error in *url.Error, whose own Error
-	// method formats the hostile value through fmt — so the flattened text
-	// may carry fmt's PANIC marker — but it must always be bounded.
-	if len(internal.Message) > len("TrustedRouter endpoint unavailable: ")+2048 {
-		t.Fatalf("message is %d bytes, want bounded", len(internal.Message))
+	if len(internal.Message) > transportErrorMessageMaxBytes {
+		t.Fatalf("message is %d bytes, want <= %d", len(internal.Message), transportErrorMessageMaxBytes)
 	}
 	if calls != 3 {
 		t.Fatalf("attempts = %d, want 3 (initial + MaxRetries 2)", calls)
 	}
 }
 
-// hostileBody is a response body whose Read fails with the hostile error.
-// Mid-stream body errors reach transportRetryError UNWRAPPED — no
-// url.Error, no fmt shielding on the direct flattening path — so this is
-// where the recover guard itself is load-bearing.
-type hostileBody struct{}
-
-func (hostileBody) Read([]byte) (int, error) { return 0, panickingTransportError{} }
-func (hostileBody) Close() error             { return nil }
-
-func TestHostileMidStreamErrorSurfacesBoundedSDKError(t *testing.T) {
-	sdk, err := NewClient(Options{APIKey: "k", HTTPClient: newRoundTripClient(func(r *http.Request) (*http.Response, error) {
-		resp := textResponse(http.StatusOK, "", nil)
-		resp.Header.Set("Content-Type", "text/event-stream")
-		resp.Body = io.NopCloser(hostileBody{})
-		return resp, nil
-	})})
-	if err != nil {
-		t.Fatal(err)
-	}
-	var streamErr error
-	for _, err := range sdk.ChatCompletionsChunks(context.Background(), ChatRequest{
-		Messages: []map[string]any{{"role": "user", "content": "hi"}},
-	}) {
-		if err != nil {
-			streamErr = err
-			break
-		}
-	}
-	if streamErr == nil {
-		t.Fatal("expected the broken stream to surface an error")
-	}
-	var internal *InternalError
-	if !errors.As(streamErr, &internal) {
-		t.Fatalf("err = %T, want *InternalError", streamErr)
-	}
+// TestNestedHostileMidStreamErrorSurfacesPlaceholder is the load-bearing
+// test for the recover guard. The body error's Error method panics WITH a
+// value whose own Error method panics, which fmt re-panics on, and it
+// arrives at the single flattening point unwrapped. Without the guard this
+// test does not merely fail — it crashes the test binary.
+func TestNestedHostileMidStreamErrorSurfacesPlaceholder(t *testing.T) {
+	internal := streamErrorFor(t, nestedPanickingTransportError{})
 	if !strings.Contains(internal.Message, "unprintable transport error") {
 		t.Fatalf("message = %q, want the bounded placeholder", internal.Message)
+	}
+	if len(internal.Message) > transportErrorMessageMaxBytes {
+		t.Fatalf("message is %d bytes, want <= %d", len(internal.Message), transportErrorMessageMaxBytes)
+	}
+}
+
+// TestHostileMidStreamErrorSurfacesBoundedSDKError covers the plain hostile
+// value on the same unwrapped path: fmt renders its marker, the SDK stays up,
+// and the message stays typed and bounded.
+func TestHostileMidStreamErrorSurfacesBoundedSDKError(t *testing.T) {
+	internal := streamErrorFor(t, panickingTransportError{})
+	if !strings.HasPrefix(internal.Message, transportErrorMessagePrefix) {
+		t.Fatalf("message = %q, want the endpoint-unavailable prefix", internal.Message)
+	}
+	if len(internal.Message) > transportErrorMessageMaxBytes {
+		t.Fatalf("message is %d bytes, want <= %d", len(internal.Message), transportErrorMessageMaxBytes)
+	}
+}
+
+// TestTransportErrorMessageIsBoundedIncludingPrefix pins the bound as a
+// property of the WHOLE message. Bounding only the flattened detail leaves
+// the prefix on top of it, which is how a "2048-byte cap" turns into 2084
+// bytes on the wire to the caller's logs.
+func TestTransportErrorMessageIsBoundedIncludingPrefix(t *testing.T) {
+	internal := streamErrorFor(t, errors.New(strings.Repeat("x", 10_000)))
+	if len(internal.Message) != transportErrorMessageMaxBytes {
+		t.Fatalf("message is %d bytes, want exactly %d (prefix included)", len(internal.Message), transportErrorMessageMaxBytes)
+	}
+}
+
+// TestFormatterRenderingIsPreserved pins the rendering path. The SDK
+// flattens through fmt, so an error that redacts in its Format method keeps
+// redacting; a direct err.Error() call would bypass Format and publish the
+// secret into the SDK error message and from there into the caller's logs.
+func TestFormatterRenderingIsPreserved(t *testing.T) {
+	internal := streamErrorFor(t, redactingError{})
+	if strings.Contains(internal.Message, "sk-live-SECRET") {
+		t.Fatalf("message = %q leaked the value the caller's Format method withholds", internal.Message)
+	}
+	if !strings.Contains(internal.Message, "authorization=[redacted]") {
+		t.Fatalf("message = %q, want the Format method's rendering", internal.Message)
 	}
 }
 
@@ -116,15 +195,44 @@ func TestSafeErrorMessageBoundsAndFallbacks(t *testing.T) {
 	if got := safeErrorMessage(nil); got != "unknown transport error" {
 		t.Fatalf("safeErrorMessage(nil) = %q", got)
 	}
-	// The direct .Error() call is exactly the shape fmt does NOT shield;
-	// only the recover guard stands between this value and a crash.
-	if got := safeErrorMessage(panickingTransportError{}); got != "unprintable transport error" {
-		t.Fatalf("safeErrorMessage(panicking) = %q", got)
-	}
-	if got := safeErrorMessage(errors.New(strings.Repeat("x", 10_000))); len(got) != 2048 {
-		t.Fatalf("len(safeErrorMessage(long)) = %d, want 2048", len(got))
-	}
 	if got := safeErrorMessage(errors.New("plain")); got != "plain" {
 		t.Fatalf("safeErrorMessage(plain) = %q", got)
+	}
+	// fmt survives a plain panicking Error method; the SDK must not crash
+	// and must not exceed the bound either way.
+	if got := safeErrorMessage(panickingTransportError{}); got == "" || len(got) > transportErrorMessageMaxBytes {
+		t.Fatalf("safeErrorMessage(panicking) = %q", got)
+	}
+	// fmt does NOT survive this one; only the recover guard does.
+	if got := safeErrorMessage(nestedPanickingTransportError{}); got != "unprintable transport error" {
+		t.Fatalf("safeErrorMessage(nested panicking) = %q, want the placeholder", got)
+	}
+	if got := safeErrorMessage(errors.New(strings.Repeat("x", 10_000))); len(got) != transportErrorMessageMaxBytes {
+		t.Fatalf("len(safeErrorMessage(long)) = %d, want %d", len(got), transportErrorMessageMaxBytes)
+	}
+}
+
+// TestTruncateStringKeepsRunesWhole pins the cut: a multi-byte rune
+// straddling the limit is dropped whole rather than sliced into replacement
+// characters, and bytes that were already invalid are left alone.
+func TestTruncateStringKeepsRunesWhole(t *testing.T) {
+	straddling := strings.Repeat("a", transportErrorMessageMaxBytes-1) + "€" + "tail"
+	got := truncateString(straddling, transportErrorMessageMaxBytes)
+	if len(got) != transportErrorMessageMaxBytes-1 {
+		t.Fatalf("len = %d, want %d (the straddling rune dropped whole)", len(got), transportErrorMessageMaxBytes-1)
+	}
+	if !utf8.ValidString(got) {
+		t.Fatalf("truncated value %q is not valid UTF-8", got[len(got)-8:])
+	}
+	if got := truncateString("abcdef", 3); got != "abc" {
+		t.Fatalf("ascii truncation = %q, want %q", got, "abc")
+	}
+	if got := truncateString("abc", 10); got != "abc" {
+		t.Fatalf("under-limit truncation = %q, want %q", got, "abc")
+	}
+	// Already-invalid bytes are not walked past: the cut lands where asked.
+	invalid := "ab\xff\xff\xff\xff\xffcd"
+	if got := truncateString(invalid, 6); len(got) != 6 {
+		t.Fatalf("len = %d, want 6 (invalid bytes left as-is)", len(got))
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"unicode/utf8"
 )
 
 // Error is the base error type returned by the TrustedRouter SDK.
@@ -177,22 +178,51 @@ func errorString(payload any, key string) string {
 	return value
 }
 
+// transportErrorMessageMaxBytes bounds the WHOLE typed transport-error
+// message, prefix included — not just the flattened detail — so
+// len(Message) <= transportErrorMessageMaxBytes is the invariant a caller
+// can rely on (TestTransportErrorMessageIsBoundedIncludingPrefix).
+const transportErrorMessageMaxBytes = 2048
+
+const transportErrorMessagePrefix = "TrustedRouter endpoint unavailable: "
+
 func transportRetryError(err error) error {
 	return &InternalError{embeddedError: &Error{
 		StatusCode: http.StatusServiceUnavailable,
-		Message:    "TrustedRouter endpoint unavailable: " + safeErrorMessage(err),
+		Message:    truncateString(transportErrorMessagePrefix+safeErrorMessage(err), transportErrorMessageMaxBytes),
 	}}
 }
 
-// safeErrorMessage flattens a transport error into a bounded string.
+// safeErrorMessage flattens a transport error into a bounded string. It is
+// the SDK's single flattening point for a transport error.
 //
-// The error value can come from a caller-injected http.Client
-// (Options.HTTPClient is used verbatim), so its Error method is arbitrary
-// code: an instrumentation wrapper whose Error panics would otherwise
-// crash the caller's process at the exact moment the SDK is trying to
-// report retry exhaustion, instead of surfacing the typed SDK error. A
-// hostile message is also capped so one pathological value cannot balloon
-// the SDK error.
+// The value is arbitrary code whenever the caller injects an http.Client
+// (Options.HTTPClient is used verbatim), so flattening it is a call into
+// code the SDK does not control, at the exact moment the SDK is trying to
+// report a failure.
+//
+// Rendering goes through fmt rather than a direct err.Error() call, so an
+// error that implements fmt.Formatter renders exactly as it did before this
+// helper existed — including any redaction it performs there. A direct
+// .Error() call would silently bypass that Format method and could surface
+// text the caller's own formatter deliberately withholds
+// (TestFormatterRenderingIsPreserved).
+//
+// The recover guard covers what fmt cannot. fmt recovers a panicking Error
+// method and renders a "%!s(PANIC=...)" marker, but it re-panics when the
+// value the Error method panics WITH itself has a panicking Error method —
+// and that shape reaches this SDK unwrapped on the mid-stream body path
+// (TestNestedHostileMidStreamErrorSurfacesPlaceholder). So the SDK no
+// longer depends on fmt's recovery for its own safety; it keeps fmt only
+// for rendering fidelity.
+//
+// The guarantee is deliberately narrow: this is one flattening point, not a
+// general shield around hostile caller-injected error values. Two shapes
+// still bypass it, both out of this function's reach. net/http calls a
+// RoundTripper error's Error method itself when it builds its own
+// Client.Timeout error, so a panic there happens inside http.Client.Do
+// before the SDK sees a value at all; and a panicking or cyclic
+// Is/Unwrap method breaks the errors.Is traversal in decodeResponse below.
 func safeErrorMessage(err error) (message string) {
 	defer func() {
 		if recover() != nil {
@@ -202,7 +232,7 @@ func safeErrorMessage(err error) (message string) {
 	if err == nil {
 		return "unknown transport error"
 	}
-	return truncateString(err.Error(), 2048)
+	return truncateString(fmt.Sprint(err), transportErrorMessageMaxBytes)
 }
 
 func decodeResponse(ctx context.Context, resp *http.Response, out any) error {
@@ -304,9 +334,24 @@ func truthy(value any) bool {
 	}
 }
 
+// truncateString bounds a string to limit BYTES without splitting a
+// multi-byte rune at the cut. It walks back at most utf8.UTFMax-1 bytes to
+// find the rune that straddles the limit and drops that rune whole; bytes
+// that were already invalid UTF-8 in the source are left exactly as they
+// were, so a message that arrives as arbitrary bytes is never mangled
+// further than the cut itself.
 func truncateString(value string, limit int) string {
 	if len(value) <= limit {
 		return value
+	}
+	for start := limit - 1; start >= 0 && limit-start < utf8.UTFMax; start-- {
+		if !utf8.RuneStart(value[start]) {
+			continue
+		}
+		if _, size := utf8.DecodeRuneInString(value[start:]); start+size > limit {
+			return value[:start]
+		}
+		break
 	}
 	return value[:limit]
 }
