@@ -396,7 +396,10 @@ func TestHeaderPrecedenceAndUserAgentShape(t *testing.T) {
 	if err := sdk.Request(context.Background(), http.MethodGet, "/models", nil, &out, nil); err != nil {
 		t.Fatal(err)
 	}
-	wantUA := "trusted-router-go/" + Version + " go/" + runtime.Version() + " " + runtime.GOOS
+	// No trailing GOOS token: the telemetry contract (§3.1) reads the UA as
+	// `trusted-router-go/SEMVER( runtime/ver)?`, and an extra token makes the
+	// whole identity unparseable server-side.
+	wantUA := "trusted-router-go/" + Version + " go/" + runtime.Version()
 	if seen.Get("user-agent") != wantUA {
 		t.Fatalf("user-agent = %q, want %q", seen.Get("user-agent"), wantUA)
 	}

@@ -52,25 +52,33 @@ func (c *Client) rawControlRequest(ctx context.Context, method, path string, bod
 	// every advance in the engine is guarded by baseIndex < len(candidates)-1,
 	// so a singleton list makes a domain move structurally impossible. Do not
 	// add a second flag.
-	return c.rawRequestWithBaseURLs(ctx, method, path, body, opts, []string{c.controlBaseURL}, true)
+	//
+	// controlPlane marks the spec so client telemetry records nothing and
+	// sends no x-tr-client header on this plane (contract §3.2).
+	return c.dispatchRequest(ctx, method, path, body, opts, []string{c.controlBaseURL}, true, true)
 }
 
 // rawRequestWithBaseURLs is a thin delegate into the transport engine. It is
 // kept (unexported) because the alias-failover tests drive it directly with
 // an injected candidate pair to prove the ADVANCE half of failover.
 func (c *Client) rawRequestWithBaseURLs(ctx context.Context, method, path string, body any, opts *CallOptions, baseURLs []string, regionalFailover bool) (*http.Response, error) {
+	return c.dispatchRequest(ctx, method, path, body, opts, baseURLs, regionalFailover, false)
+}
+
+func (c *Client) dispatchRequest(ctx context.Context, method, path string, body any, opts *CallOptions, baseURLs []string, regionalFailover, controlPlane bool) (*http.Response, error) {
 	bodyBytes, hasBody, err := marshalRequestBody(body)
 	if err != nil {
 		return nil, err
 	}
 	return c.do(ctx, requestSpec{
-		method:     method,
-		path:       path,
-		body:       bodyBytes,
-		hasBody:    hasBody,
-		opts:       opts,
-		candidates: baseURLs,
-		failover:   regionalFailover,
+		method:       method,
+		path:         path,
+		body:         bodyBytes,
+		hasBody:      hasBody,
+		opts:         opts,
+		candidates:   baseURLs,
+		failover:     regionalFailover,
+		controlPlane: controlPlane,
 	})
 }
 

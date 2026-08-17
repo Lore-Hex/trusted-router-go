@@ -84,6 +84,9 @@ type requestSpec struct {
 	failover        bool
 	streamOpen      bool
 	autoIdempotency bool
+	// controlPlane marks a control-plane call: client telemetry records
+	// nothing and sends no x-tr-client header for those (contract §3.2).
+	controlPlane bool
 }
 
 // do is THE transport engine: the only loop that advances a candidate index,
@@ -104,6 +107,15 @@ func (c *Client) do(ctx context.Context, spec requestSpec) (*http.Response, erro
 			// verbatim on every retry and every candidate domain (invariant 5).
 			spec.opts.IdempotencyKey = newIdempotencyKey()
 		}
+	}
+
+	// Client-observed reliability telemetry, header channel (contract v1
+	// §6.1: do() is the ONE emit point). One recorder per logical call;
+	// control-plane calls and opted-out clients record nothing, and the
+	// recorder's methods are nil-safe so the wiring stays unconditional.
+	var recorder *requestRecorder
+	if c.telemetry && !spec.controlPlane {
+		recorder = newRequestRecorder(spec.streamOpen)
 	}
 
 	attempt := 0
@@ -140,7 +152,8 @@ func (c *Client) do(ctx context.Context, spec requestSpec) (*http.Response, erro
 			}
 		}
 
-		req, err := c.newHTTPRequest(attemptCtx, spec.method, joinURL(spec.candidates[baseIndex], spec.path), spec.body, spec.hasBody, spec.opts)
+		recorder.beginAttempt(spec.candidates[baseIndex])
+		req, err := c.newHTTPRequest(attemptCtx, spec.method, joinURL(spec.candidates[baseIndex], spec.path), spec.body, spec.hasBody, spec.opts, recorder)
 		if err != nil {
 			stopTimer(openTimer)
 			cancelAttempt()
@@ -155,7 +168,12 @@ func (c *Client) do(ctx context.Context, spec requestSpec) (*http.Response, erro
 				cancelAttempt()
 				return nil, ctxErr
 			}
-			if spec.streamOpen && errors.Is(context.Cause(attemptCtx), errOpenTimeout) {
+			openTimedOut := spec.streamOpen && errors.Is(context.Cause(attemptCtx), errOpenTimeout)
+			// Classify for telemetry BEFORE the transportRetryError flatten
+			// below and the errOpenTimeout swap: after either, only a
+			// message string remains of the typed error chain (§6.1).
+			recorder.onTransportError(err, openTimedOut)
+			if openTimedOut {
 				err = errOpenTimeout
 			}
 			if attempt >= c.maxRetries {
@@ -169,6 +187,7 @@ func (c *Client) do(ctx context.Context, spec requestSpec) (*http.Response, erro
 			// retries, it just stays on the host the caller named.
 			if spec.failover && baseIndex < len(spec.candidates)-1 {
 				baseIndex++
+				recorder.onMoved()
 			}
 			if sleepErr := sleepForRetry(ctx, attempt, nil); sleepErr != nil {
 				return nil, sleepErr
@@ -177,6 +196,7 @@ func (c *Client) do(ctx context.Context, spec requestSpec) (*http.Response, erro
 			continue
 		}
 
+		recorder.onResponse(resp.StatusCode)
 		if attempt >= c.maxRetries || !retryable(resp.StatusCode, resp.Header) {
 			if spec.streamOpen {
 				if hasTimeout {
@@ -198,6 +218,7 @@ func (c *Client) do(ctx context.Context, spec requestSpec) (*http.Response, erro
 		// to the caller, but a second upstream generation we pay for.
 		if spec.failover && regionalFailoverable(resp.StatusCode, resp.Header) && baseIndex < len(spec.candidates)-1 {
 			baseIndex++
+			recorder.onMoved()
 		}
 		if sleepErr := sleepForRetry(ctx, attempt, retryAfter); sleepErr != nil {
 			return nil, sleepErr
@@ -222,6 +243,9 @@ func (c *Client) absoluteRequest(ctx context.Context, method, requestURL string)
 		req.Header.Set(key, value)
 	}
 	req.Header.Set("user-agent", userAgent())
+	// x-tr-client is SDK-reserved (§3.2): these credential-free one-shot
+	// fetches never carry it, even a stale caller-configured value.
+	req.Header.Del("x-tr-client")
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		cancel()
@@ -260,7 +284,7 @@ func marshalRequestBody(body any) ([]byte, bool, error) {
 	return data, true, nil
 }
 
-func (c *Client) newHTTPRequest(ctx context.Context, method, url string, bodyBytes []byte, hasBody bool, opts *CallOptions) (*http.Request, error) {
+func (c *Client) newHTTPRequest(ctx context.Context, method, url string, bodyBytes []byte, hasBody bool, opts *CallOptions, recorder *requestRecorder) (*http.Request, error) {
 	var body io.Reader
 	if hasBody {
 		body = bytes.NewReader(bodyBytes)
@@ -300,6 +324,18 @@ func (c *Client) newHTTPRequest(ctx context.Context, method, url string, bodyByt
 	if apiKey != "" {
 		req.Header.Set("authorization", "Bearer "+apiKey)
 	}
+
+	// x-tr-client is assembled here and only here (contract §6.1), and the
+	// header name is SDK-reserved across all six TrustedRouter SDKs: any
+	// caller-supplied value is removed on EVERY path — opt-out, custom
+	// bases, and control-plane calls included — and the SDK's own value is
+	// set only while telemetry is actively recording (§3.2, §6.3).
+	req.Header.Del("x-tr-client")
+	if recorder != nil {
+		if value := recorder.headerValue(); value != "" {
+			req.Header.Set("x-tr-client", value)
+		}
+	}
 	return req, nil
 }
 
@@ -307,8 +343,18 @@ func joinURL(baseURL, path string) string {
 	return strings.TrimRight(baseURL, "/") + "/" + strings.TrimLeft(path, "/")
 }
 
+// userAgent is the SDK's static telemetry identity (contract §3.1): it must
+// parse as `trusted-router-go/SEMVER( runtime/ver)?` for the enclave to
+// derive sdk/sdk_version/runtime from it. The former trailing GOOS token
+// broke that grammar and made the whole User-Agent unparseable, so the OS
+// no longer rides the UA. A runtime token outside the §5.1 grammar (e.g. a
+// devel toolchain version with spaces) is omitted rather than sent.
 func userAgent() string {
-	return "trusted-router-go/" + Version + " go/" + runtime.Version() + " " + runtime.GOOS
+	value := "trusted-router-go/" + Version
+	if runtimeToken := "go/" + runtime.Version(); telemetryRuntimeTokenRe.MatchString(runtimeToken) {
+		value += " " + runtimeToken
+	}
+	return value
 }
 
 // newIdempotencyKey is the single key-generator helper (invariant 5): every
