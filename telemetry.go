@@ -26,6 +26,8 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -208,25 +210,21 @@ func resolveTelemetryEnabled(explicit *bool, baseURL, controlBaseURL string, get
 const telemetryMaxErrorChainLinks = 6
 
 // telemetryErrorChain flattens an error into at most
-// telemetryMaxErrorChainLinks links, following both Unwrap() error and
-// Unwrap() []error.
+// telemetryMaxErrorChainLinks links, but only through known standard-library
+// wrappers. Exported wrappers are unwrapped through their fields. A short
+// allowlist covers standard-library wrappers whose fields are private; their
+// concrete package path and type name are checked before an Unwrap method is
+// called.
 //
-// Classification walks this bounded chain and tests each link on its own.
-// errors.Is and errors.As must NOT be used for it: they walk the chain
-// themselves, without a bound and without cycle detection, so a single
-// caller-injected error whose Unwrap returns itself — reachable because
-// Options.HTTPClient is used verbatim — spins the engine goroutine forever.
-// That is a hang, not a panic: recoverTelemetryPanic cannot end it, the
-// request that was about to be retried is never sent, and the caller's
-// context cancellation cannot interrupt a synchronous loop. Telemetry may
-// never fail a request (§2.2), and hanging it is the worst way to fail it.
-//
-// The length bound alone makes the walk terminate, which is why there is no
-// seen-set here: a set keyed on error VALUES is not safe in Go, because
-// hashing (or comparing) an error whose dynamic type is unhashable — a struct
-// with a slice field, say — panics with "hash of unhashable type". A cyclic
-// chain simply yields the same link repeatedly until the bound stops it, and
-// classifying the same link six times gives the same answer as once.
+// Classification must not call arbitrary Error, Is, Timeout, or Unwrap
+// methods. Options.HTTPClient accepts a caller-supplied RoundTripper, so any
+// of those methods may block forever. A link bound limits the number of
+// callbacks, not the time spent in one callback, and neither recover nor
+// context cancellation can interrupt a synchronous method that never
+// returns. Unknown and caller-defined wrappers therefore remain opaque and
+// classify as unknown unless their concrete outer type supplies a safe fact.
+// This deliberately trades classification of custom middleware wrappers for
+// the §2.2 guarantee that telemetry never delays the request.
 func telemetryErrorChain(err error) []error {
 	chain := make([]error, 0, telemetryMaxErrorChainLinks)
 	queue := []error{err}
@@ -237,20 +235,91 @@ func telemetryErrorChain(err error) []error {
 			continue
 		}
 		chain = append(chain, link)
-		switch unwrapper := link.(type) {
-		case interface{ Unwrap() error }:
-			queue = append(queue, unwrapper.Unwrap())
-		case interface{ Unwrap() []error }:
-			branches := unwrapper.Unwrap()
-			// A hostile Unwrap can return an enormous slice; only ever take
-			// as many branches as the bound could still consume.
-			if len(branches) > telemetryMaxErrorChainLinks {
-				branches = branches[:telemetryMaxErrorChainLinks]
-			}
-			queue = append(queue, branches...)
+		children := telemetryStandardErrorChildren(link)
+		remaining := telemetryMaxErrorChainLinks - len(chain)
+		if len(children) > remaining {
+			children = children[:remaining]
 		}
+		queue = append(queue, children...)
 	}
 	return chain
+}
+
+// telemetryStandardErrorChildren unwraps only concrete wrappers owned by the
+// standard library. The exported cases use fields, so even a user-constructed
+// wrapper containing a hostile error cannot dispatch to that error's code.
+//
+// fmt/errors and a few net/http/TLS wrappers have private fields. Package path
+// plus concrete type name is compiler-owned identity that caller code cannot
+// impersonate. Invoking Unwrap only after that check preserves common %w,
+// errors.Join, and net/http chains without opening a callback boundary to an
+// arbitrary error implementation. Unknown wrappers are intentionally opaque.
+func telemetryStandardErrorChildren(err error) []error {
+	switch typed := err.(type) {
+	case *url.Error:
+		if typed != nil {
+			return []error{typed.Err}
+		}
+	case *net.OpError:
+		if typed != nil {
+			return []error{typed.Err}
+		}
+	case *net.DNSError:
+		if typed != nil {
+			return []error{typed.UnwrapErr}
+		}
+	case *net.DNSConfigError:
+		if typed != nil {
+			return []error{typed.Err}
+		}
+	case *os.PathError:
+		if typed != nil {
+			return []error{typed.Err}
+		}
+	case *os.LinkError:
+		if typed != nil {
+			return []error{typed.Err}
+		}
+	case *os.SyscallError:
+		if typed != nil {
+			return []error{typed.Err}
+		}
+	case *tls.CertificateVerificationError:
+		if typed != nil {
+			return []error{typed.Err}
+		}
+	}
+
+	packagePath, typeName := telemetryConcreteErrorType(err)
+	switch {
+	case packagePath == "fmt" && typeName == "wrapError",
+		packagePath == "net/http" && typeName == "transportReadFromServerError",
+		packagePath == "net/http" && typeName == "nothingWrittenError",
+		packagePath == "crypto/tls" && typeName == "permanentError":
+		if unwrapper, ok := err.(interface{ Unwrap() error }); ok {
+			return []error{unwrapper.Unwrap()}
+		}
+	case packagePath == "fmt" && typeName == "wrapErrors",
+		packagePath == "errors" && typeName == "joinError":
+		if unwrapper, ok := err.(interface{ Unwrap() []error }); ok {
+			return unwrapper.Unwrap()
+		}
+	}
+	return nil
+}
+
+func telemetryConcreteErrorType(err error) (packagePath, typeName string) {
+	if err == nil {
+		return "", ""
+	}
+	typeOf := reflect.TypeOf(err)
+	for typeOf.Kind() == reflect.Pointer {
+		if reflect.ValueOf(err).IsNil() {
+			return "", ""
+		}
+		typeOf = typeOf.Elem()
+	}
+	return typeOf.PkgPath(), typeOf.Name()
 }
 
 func chainHas(chain []error, predicate func(error) bool) bool {
@@ -262,18 +331,12 @@ func chainHas(chain []error, predicate func(error) bool) bool {
 	return false
 }
 
-// linkIs compares ONE link against a sentinel without traversing anything.
-// The == comparison cannot panic here: interface comparison only panics when
-// both dynamic types are identical and unhashable, and every sentinel passed
-// in is a comparable type. A link's own Is method is consulted because that is
-// how errors.Is would have matched it, and it is exactly one call per link —
-// bounded, unlike the traversal it replaces.
+// linkIs compares ONE link against a sentinel without traversing anything or
+// consulting a caller-defined Is method. The == comparison cannot panic here:
+// interface comparison only compares values when their dynamic types are
+// identical, and every sentinel passed here has a comparable concrete type.
 func linkIs(link, sentinel error) bool {
-	if link == sentinel {
-		return true
-	}
-	comparer, ok := link.(interface{ Is(error) bool })
-	return ok && comparer.Is(sentinel)
+	return link == sentinel
 }
 
 // classifyTransportError maps a transport error surfaced by this SDK's
@@ -345,8 +408,22 @@ func isDeadlineExceededLink(link error) bool {
 }
 
 func isTimeoutLink(link error) bool {
-	netErr, ok := link.(net.Error)
-	return ok && netErr.Timeout()
+	if linkIs(link, context.DeadlineExceeded) || linkIs(link, os.ErrDeadlineExceeded) {
+		return true
+	}
+	switch typed := link.(type) {
+	case *net.DNSError:
+		return typed != nil && typed.IsTimeout
+	case syscall.Errno:
+		// Invoke no interface hook: this is the concrete standard-library
+		// integer type, whose Timeout method is a fixed errno comparison.
+		return typed.Timeout()
+	}
+	packagePath, typeName := telemetryConcreteErrorType(link)
+	return (packagePath == "net" && typeName == "timeoutError") ||
+		(packagePath == "net/http" && (typeName == "timeoutError" || typeName == "tlsHandshakeTimeoutError")) ||
+		(packagePath == "crypto/tls" && typeName == "timeoutError") ||
+		(packagePath == "internal/poll" && typeName == "DeadlineExceededError")
 }
 
 func opLink(link error, op string) bool {
@@ -364,10 +441,11 @@ func isWriteOpLink(link error) bool { return opLink(link, "write") }
 // otherwise claim.
 func isProxyConnectLink(link error) bool { return opLink(link, "proxyconnect") }
 
-// isTLSHandshakeTimeoutLink recognizes net/http's unexported
-// tlsHandshakeTimeoutError, which is reachable only by its message.
+// isTLSHandshakeTimeoutLink recognizes net/http's unexported concrete type
+// without calling its Error or Timeout methods.
 func isTLSHandshakeTimeoutLink(link error) bool {
-	return strings.Contains(link.Error(), "TLS handshake timeout")
+	packagePath, typeName := telemetryConcreteErrorType(link)
+	return packagePath == "net/http" && typeName == "tlsHandshakeTimeoutError"
 }
 
 func isDNSLink(link error) bool {
@@ -403,9 +481,9 @@ func isTLSLink(link error) bool {
 	return false
 }
 
-// isProtocolLink sniffs the HTTP-protocol failures net/http surfaces only as
-// strings: the bundled http2 transport's errors and HTTP/1.x response parse
-// failures have no exported types to match on.
+// isProtocolLink recognizes the HTTP-protocol failures net/http surfaces as
+// private concrete types or as safe standard-library strings. It never calls
+// Error on a caller-defined value.
 //
 // The stream/connection forms are how the bundled http2 StreamError and
 // ConnectionError actually render (h2_bundle.go formats them as "stream
@@ -414,19 +492,34 @@ func isTLSLink(link error) bool {
 // failure, "stream error: stream ID 1; INTERNAL_ERROR; received from peer" —
 // classified as "unknown" before they were added. trusted-router-py sees
 // httpx.RemoteProtocolError for these and reports protocol_error.
-//
-// They are matched as PREFIXES of the individual link, not as substrings of
-// the whole flattened chain: an outer *net.OpError inherits the text of what
-// it wraps, so a substring test on the outer message would let this steal
-// io_error from a read/write op that happens to wrap one of these.
 func isProtocolLink(link error) bool {
-	message := link.Error()
+	packagePath, typeName := telemetryConcreteErrorType(link)
+	if packagePath == "net/http" && (typeName == "ProtocolError" || strings.HasPrefix(typeName, "http2")) {
+		return true
+	}
+	message, ok := telemetrySafeStandardErrorText(link)
+	if !ok {
+		return false
+	}
 	return strings.Contains(message, "http2") ||
 		strings.Contains(message, "HTTP/2") ||
 		strings.Contains(message, "malformed HTTP") ||
 		strings.Contains(message, "PROTOCOL_ERROR") ||
 		strings.HasPrefix(message, "stream error: stream ID ") ||
 		strings.HasPrefix(message, "connection error: ")
+}
+
+// telemetrySafeStandardErrorText returns text only for standard-library
+// concrete types whose Error method simply returns already-stored text. In
+// particular it excludes wrappers such as *url.Error and errors.joinError,
+// whose Error methods dispatch to their children.
+func telemetrySafeStandardErrorText(err error) (string, bool) {
+	packagePath, typeName := telemetryConcreteErrorType(err)
+	if (packagePath == "errors" && typeName == "errorString") ||
+		(packagePath == "fmt" && (typeName == "wrapError" || typeName == "wrapErrors")) {
+		return err.Error(), true
+	}
+	return "", false
 }
 
 func clampDurationMS(d time.Duration) int64 {
@@ -441,16 +534,15 @@ func clampDurationMS(d time.Duration) int64 {
 }
 
 // telemetryAttempt is the header-channel subset of the per-attempt facts
-// (§3.2): index, host enum, outcome, error class, elapsed, and whether the
-// candidate index advanced after it. The beacon-only fields (http_status,
-// ttfb, request_id, retry_after, should_retry) arrive with the beacon PR.
+// (§3.2): index, host enum, outcome, error class, and elapsed time. The
+// beacon-only fields (http_status, ttfb, request_id, retry_after,
+// should_retry) arrive with the beacon PR.
 type telemetryAttempt struct {
 	index      int
 	host       string
 	outcome    string
 	errorClass string // "" renders as pc=none
 	elapsedMS  int64
-	moved      bool
 }
 
 // requestRecorder records ONE logical inference call as the engine loop
@@ -460,8 +552,9 @@ type telemetryAttempt struct {
 // header_value flow. All methods are nil-receiver safe so the engine wiring
 // stays unconditional (§2.2).
 type requestRecorder struct {
-	streaming bool
-	attempts  []telemetryAttempt
+	streaming      bool
+	lastAttempt    telemetryAttempt
+	hasLastAttempt bool
 	// nextIndex counts attempts STARTED, independently of attempts
 	// successfully recorded. Deriving the index from len(attempts) instead
 	// meant a recovered callback panic — which loses that attempt's record —
@@ -482,10 +575,9 @@ func newRequestRecorder(streaming bool) *requestRecorder {
 }
 
 // recoverTelemetryPanic is deferred by every recorder callback: telemetry
-// runs synchronously on the money path, and a hostile error value — an
-// Error(), Unwrap(), or As() that panics, reachable through a
-// caller-injected http.Client — must cost at most a missing telemetry
-// record, never the user's request (§2.2).
+// runs synchronously on the money path, and an unexpected bug or malformed
+// standard-library wrapper must cost at most a missing telemetry record,
+// never the user's request (§2.2).
 func recoverTelemetryPanic() {
 	_ = recover()
 }
@@ -581,22 +673,16 @@ func (r *requestRecorder) onMoved() {
 	}
 	defer recoverTelemetryPanic()
 	r.failoverUsed = true
-	if last := len(r.attempts) - 1; last >= 0 {
-		r.attempts[last].moved = true
-	}
 }
 
-// storeAttempt appends the record for the attempt in flight, replacing it if
-// that attempt is re-recorded. Records are keyed by their own index rather
-// than by slice position: a dropped record leaves a GAP in the indices, and
-// position-based storage would then file later attempts under earlier
-// attempts' numbers.
+// storeAttempt retains only the attempt in flight. Header assembly reads only
+// the immediately preceding attempt, so keeping the full history would make
+// recorder memory grow with the uncapped MaxRetries option for no wire-level
+// benefit. The record carries its own index so a callback panic still leaves a
+// detectable gap rather than causing an older attempt to be misreported.
 func (r *requestRecorder) storeAttempt(attempt telemetryAttempt) {
-	if last := len(r.attempts) - 1; last >= 0 && r.attempts[last].index == attempt.index {
-		r.attempts[last] = attempt
-		return
-	}
-	r.attempts = append(r.attempts, attempt)
+	r.lastAttempt = attempt
+	r.hasLastAttempt = true
 }
 
 // headerValue assembles the §3.2 grammar for the attempt in flight, in the
@@ -624,10 +710,10 @@ func (r *requestRecorder) headerValue() (value string) {
 	}
 	parts := []string{"v=1", "a=" + strconv.Itoa(r.currentIndex)}
 	if r.currentIndex > 0 {
-		if len(r.attempts) == 0 {
+		if !r.hasLastAttempt {
 			return ""
 		}
-		previous := r.attempts[len(r.attempts)-1]
+		previous := r.lastAttempt
 		if previous.index != r.currentIndex-1 {
 			// The immediately preceding attempt has no record — it was lost
 			// to a recovered callback panic. po/pc/ph/pm are defined as the

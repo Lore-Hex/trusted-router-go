@@ -20,6 +20,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -137,20 +138,20 @@ func TestXTRClientRetryVectorMatchesContractExample(t *testing.T) {
 	start := time.Now()
 	recorder := &requestRecorder{
 		streaming: true,
-		attempts: []telemetryAttempt{{
+		lastAttempt: telemetryAttempt{
 			index:      0,
 			host:       "apex",
 			outcome:    "timeout",
 			errorClass: "connect_timeout",
 			elapsedMS:  10012,
-			moved:      true,
-		}},
-		failoverUsed: true,
-		firstStarted: start,
-		attemptStart: start.Add(10530 * time.Millisecond),
-		currentHost:  "ally",
-		currentIndex: 1,
-		begun:        true,
+		},
+		hasLastAttempt: true,
+		failoverUsed:   true,
+		firstStarted:   start,
+		attemptStart:   start.Add(10530 * time.Millisecond),
+		currentHost:    "ally",
+		currentIndex:   1,
+		begun:          true,
 	}
 	want := "v=1;a=1;po=timeout;pc=connect_timeout;ph=apex;pm=10012;sm=10530;s=1;fo=1"
 	if got := recorder.headerValue(); got != want {
@@ -1004,7 +1005,7 @@ func TestTelemetryHeaderBoundsAndGrammar(t *testing.T) {
 		start := time.Now()
 		return &requestRecorder{
 			streaming: true,
-			attempts: []telemetryAttempt{{
+			lastAttempt: telemetryAttempt{
 				// The previous attempt's index must be currentIndex-1: the
 				// po/pc/ph/pm keys are defined as THAT attempt's facts, and
 				// headerValue refuses to describe any other attempt under
@@ -1014,13 +1015,14 @@ func TestTelemetryHeaderBoundsAndGrammar(t *testing.T) {
 				outcome:    "transport_error",
 				errorClass: "connect_timeout",
 				elapsedMS:  3_600_000,
-			}},
-			failoverUsed: true,
-			firstStarted: start,
-			attemptStart: start.Add(2 * time.Hour), // clamped to 3600000
-			currentHost:  "ally",
-			currentIndex: 99,
-			begun:        true,
+			},
+			hasLastAttempt: true,
+			failoverUsed:   true,
+			firstStarted:   start,
+			attemptStart:   start.Add(2 * time.Hour), // clamped to 3600000
+			currentHost:    "ally",
+			currentIndex:   99,
+			begun:          true,
 		}
 	}
 
@@ -1052,7 +1054,7 @@ func TestTelemetryHeaderBoundsAndGrammar(t *testing.T) {
 
 	t.Run("out-of-grammar value sends nothing", func(t *testing.T) {
 		recorder := worstCase()
-		recorder.attempts[0].errorClass = "Not Valid!"
+		recorder.lastAttempt.errorClass = "Not Valid!"
 		if got := recorder.headerValue(); got != "" {
 			t.Fatalf("headerValue() = %q, want suppression", got)
 		}
@@ -1061,9 +1063,9 @@ func TestTelemetryHeaderBoundsAndGrammar(t *testing.T) {
 	t.Run("oversized header sends nothing", func(t *testing.T) {
 		recorder := worstCase()
 		long := strings.Repeat("a", 60)
-		recorder.attempts[0].outcome = long
-		recorder.attempts[0].errorClass = long
-		recorder.attempts[0].host = long
+		recorder.lastAttempt.outcome = long
+		recorder.lastAttempt.errorClass = long
+		recorder.lastAttempt.host = long
 		if got := recorder.headerValue(); got != "" {
 			t.Fatalf("headerValue() = %q, want suppression", got)
 		}
@@ -1074,7 +1076,7 @@ func TestTelemetryHeaderBoundsAndGrammar(t *testing.T) {
 		// callback panic), so its facts are gone. Reporting the attempt
 		// before it under this attempt's index would be a false report.
 		recorder := worstCase()
-		recorder.attempts[0].index = 97
+		recorder.lastAttempt.index = 97
 		if got := recorder.headerValue(); got != "" {
 			t.Fatalf("headerValue() = %q, want suppression when the previous attempt has no record", got)
 		}
@@ -1088,6 +1090,41 @@ func TestTelemetryHeaderBoundsAndGrammar(t *testing.T) {
 			t.Fatalf("clampDurationMS(48h) = %d, want 3600000", got)
 		}
 	})
+}
+
+// TestRequestRecorderRetainsOnlyTheLastAttempt is the memory-bound regression
+// for Options.MaxRetries, which is intentionally uncapped. The header for an
+// attempt reads only its immediate predecessor, so even a pathological retry
+// count must leave exactly one attempt record reachable from the recorder.
+func TestRequestRecorderRetainsOnlyTheLastAttempt(t *testing.T) {
+	const attemptCount = 10_000
+	recorder := newRequestRecorder(false)
+	for i := 0; i < attemptCount; i++ {
+		recorder.beginAttempt(DefaultAPIBaseURL)
+		recorder.onResponse(http.StatusServiceUnavailable)
+	}
+	if recorder.nextIndex != attemptCount {
+		t.Fatalf("nextIndex = %d, want %d", recorder.nextIndex, attemptCount)
+	}
+	if !recorder.hasLastAttempt || recorder.lastAttempt.index != attemptCount-1 {
+		t.Fatalf("retained attempt = (%t, %d), want (true, %d)", recorder.hasLastAttempt, recorder.lastAttempt.index, attemptCount-1)
+	}
+
+	recorderType := reflect.TypeOf(*recorder)
+	attemptType := reflect.TypeOf(telemetryAttempt{})
+	attemptFields := 0
+	for i := 0; i < recorderType.NumField(); i++ {
+		field := recorderType.Field(i)
+		if field.Type == attemptType {
+			attemptFields++
+		}
+		if field.Type == reflect.SliceOf(attemptType) {
+			t.Fatalf("requestRecorder.%s retains an attempt history; recorder state must stay O(1)", field.Name)
+		}
+	}
+	if attemptFields != 1 {
+		t.Fatalf("requestRecorder retains %d scalar attempt records, want exactly 1", attemptFields)
+	}
 }
 
 func TestHostEnumMapping(t *testing.T) {
@@ -1325,17 +1362,14 @@ func TestLostAttemptRecordDoesNotRewindTheAttemptIndex(t *testing.T) {
 }
 
 // selfUnwrappingError is a caller-injected error whose Unwrap returns itself.
-// errors.Is and errors.As have no cycle detection and no depth bound, so any
-// classification built on them spins forever on this value — the request that
-// was about to be retried is never sent, and the caller's context cannot
-// interrupt a synchronous loop.
+// Telemetry must leave it opaque rather than calling the custom hook at all.
 type selfUnwrappingError struct{}
 
 func (selfUnwrappingError) Error() string   { return "cyclic transport error" }
 func (e selfUnwrappingError) Unwrap() error { return e }
 
-// deepUnwrappingError builds a chain longer than the bound, to prove the walk
-// stops counting rather than merely surviving cycles.
+// deepUnwrappingError would build a long chain if its caller-defined Unwrap
+// hook were dispatched. Telemetry must retain it as one opaque link.
 type deepUnwrappingError struct{ depth int }
 
 func (e deepUnwrappingError) Error() string { return "deep transport error" }
@@ -1346,12 +1380,12 @@ func (e deepUnwrappingError) Unwrap() error {
 	return deepUnwrappingError{depth: e.depth - 1}
 }
 
-func TestErrorChainWalkIsBounded(t *testing.T) {
-	if got := len(telemetryErrorChain(selfUnwrappingError{})); got != telemetryMaxErrorChainLinks {
-		t.Fatalf("cyclic chain length = %d, want the bound %d", got, telemetryMaxErrorChainLinks)
+func TestErrorChainWalksOnlyKnownStandardLibraryWrappers(t *testing.T) {
+	if got := len(telemetryErrorChain(selfUnwrappingError{})); got != 1 {
+		t.Fatalf("custom cyclic chain length = %d, want 1 opaque link", got)
 	}
-	if got := len(telemetryErrorChain(deepUnwrappingError{depth: 100})); got != telemetryMaxErrorChainLinks {
-		t.Fatalf("deep chain length = %d, want the bound %d", got, telemetryMaxErrorChainLinks)
+	if got := len(telemetryErrorChain(deepUnwrappingError{depth: 100})); got != 1 {
+		t.Fatalf("custom deep chain length = %d, want 1 opaque link", got)
 	}
 	if got := len(telemetryErrorChain(errors.New("flat"))); got != 1 {
 		t.Fatalf("flat chain length = %d, want 1", got)
@@ -1369,20 +1403,77 @@ func TestErrorChainWalkIsBounded(t *testing.T) {
 	}
 }
 
-// TestCyclicErrorChainCannotHangTheRequest is the failure-isolation test for
-// the bounded walk. §2.2 says telemetry may never fail a request, and hanging
-// one is the worst way to fail it: a recovered panic costs a telemetry record,
-// but an unbounded traversal costs the caller their request, with no error and
-// no way out.
-func TestCyclicErrorChainCannotHangTheRequest(t *testing.T) {
+type telemetryHookProbe struct {
+	errorCalls   int
+	isCalls      int
+	timeoutCalls int
+	unwrapCalls  int
+}
+
+func (e *telemetryHookProbe) Error() string {
+	e.errorCalls++
+	return "custom telemetry hook probe"
+}
+
+func (e *telemetryHookProbe) Is(error) bool {
+	e.isCalls++
+	return false
+}
+
+func (e *telemetryHookProbe) Timeout() bool {
+	e.timeoutCalls++
+	return false
+}
+
+func (e *telemetryHookProbe) Unwrap() error {
+	e.unwrapCalls++
+	return syscall.ECONNREFUSED
+}
+
+func TestClassificationDoesNotDispatchCustomErrorHooks(t *testing.T) {
+	probe := &telemetryHookProbe{}
+	if got := classifyTransportError(probe); got != "unknown" {
+		t.Fatalf("classifyTransportError(custom hooks) = %q, want %q", got, "unknown")
+	}
+	if probe.errorCalls != 0 || probe.isCalls != 0 || probe.timeoutCalls != 0 || probe.unwrapCalls != 0 {
+		t.Fatalf("telemetry dispatched custom hooks: Error=%d Is=%d Timeout=%d Unwrap=%d", probe.errorCalls, probe.isCalls, probe.timeoutCalls, probe.unwrapCalls)
+	}
+}
+
+type blockingUnwrapError struct {
+	called  chan struct{}
+	release chan struct{}
+}
+
+func (*blockingUnwrapError) Error() string { return "blocking custom unwrap" }
+
+func (e *blockingUnwrapError) Unwrap() error {
+	close(e.called)
+	<-e.release
+	return nil
+}
+
+// TestBlockingCustomUnwrapIsNotCalledByTheEngine is the real retry-engine
+// failure-isolation regression. A link-count bound is insufficient because a
+// single Unwrap call can block forever; telemetry must make zero such calls,
+// record the custom error as unknown, and allow the retry to succeed.
+func TestBlockingCustomUnwrapIsNotCalledByTheEngine(t *testing.T) {
 	clearTelemetryEnv(t)
 	defer stubSleep(func(context.Context, time.Duration) error { return nil })()
+	blocking := &blockingUnwrapError{
+		called:  make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	defer close(blocking.release)
 
+	var headers []string
 	calls := 0
-	sdk, err := NewClient(Options{APIKey: "k", HTTPClient: newRoundTripClient(func(r *http.Request) (*http.Response, error) {
+	maxRetries := 1
+	sdk, err := NewClient(Options{APIKey: "k", MaxRetries: &maxRetries, HTTPClient: newRoundTripClient(func(r *http.Request) (*http.Response, error) {
+		headers = append(headers, r.Header.Get("x-tr-client"))
 		calls++
 		if calls == 1 {
-			return nil, selfUnwrappingError{}
+			return nil, blocking
 		}
 		return jsonResponse(http.StatusOK, map[string]any{"ok": true}, nil), nil
 	})})
@@ -1403,8 +1494,20 @@ func TestCyclicErrorChainCannotHangTheRequest(t *testing.T) {
 		if calls != 2 {
 			t.Fatalf("attempts = %d, want 2 (the retry must still happen)", calls)
 		}
-	case <-time.After(15 * time.Second):
-		t.Fatal("request never returned: telemetry classification is traversing the error chain without a bound")
+	case <-time.After(2 * time.Second):
+		t.Fatal("request never returned: telemetry called the blocking custom Unwrap")
+	}
+	select {
+	case <-blocking.called:
+		t.Fatal("telemetry called the custom Unwrap method")
+	default:
+	}
+	if len(headers) != 2 {
+		t.Fatalf("captured headers = %d, want 2", len(headers))
+	}
+	fields := parseTelemetryHeader(t, headers[1])
+	if fields["po"] != "transport_error" || fields["pc"] != "unknown" {
+		t.Fatalf("retry x-tr-client = %q, want custom error recorded as transport_error/unknown", headers[1])
 	}
 }
 
