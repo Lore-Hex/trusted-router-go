@@ -22,7 +22,6 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -202,24 +201,102 @@ func resolveTelemetryEnabled(explicit *bool, baseURL, controlBaseURL string, get
 	return hostEnum(baseURL) != telemetryHostCustom && isTelemetryControlHost(controlBaseURL)
 }
 
+// telemetryMaxErrorChainLinks bounds the error-chain walk, mirroring
+// trusted-router-py _exception_chain's own limit of 6. Every real chain this
+// SDK produces is far shorter: the deepest is connect-refused at four links
+// (*url.Error, *net.OpError, *os.SyscallError, syscall.Errno).
+const telemetryMaxErrorChainLinks = 6
+
+// telemetryErrorChain flattens an error into at most
+// telemetryMaxErrorChainLinks links, following both Unwrap() error and
+// Unwrap() []error.
+//
+// Classification walks this bounded chain and tests each link on its own.
+// errors.Is and errors.As must NOT be used for it: they walk the chain
+// themselves, without a bound and without cycle detection, so a single
+// caller-injected error whose Unwrap returns itself — reachable because
+// Options.HTTPClient is used verbatim — spins the engine goroutine forever.
+// That is a hang, not a panic: recoverTelemetryPanic cannot end it, the
+// request that was about to be retried is never sent, and the caller's
+// context cancellation cannot interrupt a synchronous loop. Telemetry may
+// never fail a request (§2.2), and hanging it is the worst way to fail it.
+//
+// The length bound alone makes the walk terminate, which is why there is no
+// seen-set here: a set keyed on error VALUES is not safe in Go, because
+// hashing (or comparing) an error whose dynamic type is unhashable — a struct
+// with a slice field, say — panics with "hash of unhashable type". A cyclic
+// chain simply yields the same link repeatedly until the bound stops it, and
+// classifying the same link six times gives the same answer as once.
+func telemetryErrorChain(err error) []error {
+	chain := make([]error, 0, telemetryMaxErrorChainLinks)
+	queue := []error{err}
+	for len(queue) > 0 && len(chain) < telemetryMaxErrorChainLinks {
+		link := queue[0]
+		queue = queue[1:]
+		if link == nil {
+			continue
+		}
+		chain = append(chain, link)
+		switch unwrapper := link.(type) {
+		case interface{ Unwrap() error }:
+			queue = append(queue, unwrapper.Unwrap())
+		case interface{ Unwrap() []error }:
+			branches := unwrapper.Unwrap()
+			// A hostile Unwrap can return an enormous slice; only ever take
+			// as many branches as the bound could still consume.
+			if len(branches) > telemetryMaxErrorChainLinks {
+				branches = branches[:telemetryMaxErrorChainLinks]
+			}
+			queue = append(queue, branches...)
+		}
+	}
+	return chain
+}
+
+func chainHas(chain []error, predicate func(error) bool) bool {
+	for _, link := range chain {
+		if predicate(link) {
+			return true
+		}
+	}
+	return false
+}
+
+// linkIs compares ONE link against a sentinel without traversing anything.
+// The == comparison cannot panic here: interface comparison only panics when
+// both dynamic types are identical and unhashable, and every sentinel passed
+// in is a comparable type. A link's own Is method is consulted because that is
+// how errors.Is would have matched it, and it is exactly one call per link —
+// bounded, unlike the traversal it replaces.
+func linkIs(link, sentinel error) bool {
+	if link == sentinel {
+		return true
+	}
+	comparer, ok := link.(interface{ Is(error) bool })
+	return ok && comparer.Is(sentinel)
+}
+
 // classifyTransportError maps a transport error surfaced by this SDK's
 // http.Client usage to the closed ErrorClass vocabulary (§5.2). It must run
 // BEFORE transportRetryError flattens the typed chain into a message string
 // (§6.1). Precedence mirrors trusted-router-py classify_transport_error:
-// timeouts, then dns/tls/refused/reset, then generic dial, protocol, io.
+// timeouts, then dns/tls/refused/reset, then generic dial, protocol, io — and
+// like the reference it asks "does ANY link in the bounded chain look like
+// this?", link by link.
 func classifyTransportError(err error) string {
 	if err == nil {
 		return "unknown"
 	}
-	if errors.Is(err, context.DeadlineExceeded) || isNetTimeoutError(err) {
+	chain := telemetryErrorChain(err)
+	if chainHas(chain, isDeadlineExceededLink) || chainHas(chain, isTimeoutLink) {
 		switch {
-		case isDialError(err), isProxyConnectError(err), isTLSHandshakeTimeout(err):
+		case chainHas(chain, isDialOpLink), chainHas(chain, isProxyConnectLink), chainHas(chain, isTLSHandshakeTimeoutLink):
 			// TCP dial, proxy CONNECT, and the TLS handshake are all
 			// connection establishment: httpx folds them into
 			// ConnectTimeout (checked before ProxyError in the py
 			// reference), so the Go classes mirror that.
 			return "connect_timeout"
-		case isWriteOpError(err):
+		case chainHas(chain, isWriteOpLink):
 			// trusted-router-py maps httpx.WriteTimeout to write_timeout;
 			// the Go equivalent is a timed-out write op in the chain.
 			return "write_timeout"
@@ -227,7 +304,7 @@ func classifyTransportError(err error) string {
 			return "read_timeout"
 		}
 	}
-	if isProxyConnectError(err) {
+	if chainHas(chain, isProxyConnectLink) {
 		// Checked BEFORE dns/refused/reset: net/http wraps the proxy dial
 		// failure around those same errors (*net.OpError{Op:
 		// "proxyconnect"}), and a user's broken proxy must not be
@@ -235,111 +312,121 @@ func classifyTransportError(err error) string {
 		// §8 availability denominator while connect_refused counts.
 		return "proxy_error"
 	}
-	var dnsErr *net.DNSError
-	if errors.As(err, &dnsErr) {
+	if chainHas(chain, isDNSLink) {
 		return "dns"
 	}
-	if isTLSError(err) {
+	if chainHas(chain, isTLSLink) {
 		return "tls"
 	}
-	if errors.Is(err, syscall.ECONNREFUSED) {
+	if chainHas(chain, func(link error) bool { return linkIs(link, syscall.ECONNREFUSED) }) {
 		return "connect_refused"
 	}
-	if errors.Is(err, syscall.ECONNRESET) {
+	if chainHas(chain, func(link error) bool { return linkIs(link, syscall.ECONNRESET) }) {
 		return "reset"
 	}
-	if isDialError(err) {
+	if chainHas(chain, isDialOpLink) {
 		return "connect_error"
 	}
-	if isProtocolError(err) {
-		return "protocol_error"
-	}
-	if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) || isReadWriteError(err) {
+	if chainHas(chain, isIOLink) {
+		// Checked BEFORE protocol: a read/write op error is the more
+		// specific fact, and the protocol test below matches on message
+		// text, which an OpError's message can contain by inheritance
+		// from the error it wraps.
 		return "io_error"
+	}
+	if chainHas(chain, isProtocolLink) {
+		return "protocol_error"
 	}
 	return "unknown"
 }
 
-func isNetTimeoutError(err error) bool {
-	var netErr net.Error
-	return errors.As(err, &netErr) && netErr.Timeout()
+func isDeadlineExceededLink(link error) bool {
+	return linkIs(link, context.DeadlineExceeded)
 }
 
-func isDialError(err error) bool {
-	var opErr *net.OpError
-	return errors.As(err, &opErr) && opErr.Op == "dial"
+func isTimeoutLink(link error) bool {
+	netErr, ok := link.(net.Error)
+	return ok && netErr.Timeout()
 }
 
-func isWriteOpError(err error) bool {
-	var opErr *net.OpError
-	return errors.As(err, &opErr) && opErr.Op == "write"
+func opLink(link error, op string) bool {
+	opErr, ok := link.(*net.OpError)
+	return ok && opErr.Op == op
 }
 
-// isProxyConnectError recognizes net/http's proxy-dial wrapper
-// (*net.OpError{Op: "proxyconnect"}); errors.As surfaces the outermost
-// OpError, so the wrapper is seen before the dial error inside it.
-func isProxyConnectError(err error) bool {
-	var opErr *net.OpError
-	return errors.As(err, &opErr) && opErr.Op == "proxyconnect"
-}
+func isDialOpLink(link error) bool { return opLink(link, "dial") }
 
-// isTLSHandshakeTimeout recognizes net/http's unexported
+func isWriteOpLink(link error) bool { return opLink(link, "write") }
+
+// isProxyConnectLink recognizes net/http's proxy-dial wrapper
+// (*net.OpError{Op: "proxyconnect"}), which sits OUTSIDE the dial error it
+// wraps — so proxy_error is decided before the classes that dial error would
+// otherwise claim.
+func isProxyConnectLink(link error) bool { return opLink(link, "proxyconnect") }
+
+// isTLSHandshakeTimeoutLink recognizes net/http's unexported
 // tlsHandshakeTimeoutError, which is reachable only by its message.
-func isTLSHandshakeTimeout(err error) bool {
-	return strings.Contains(err.Error(), "TLS handshake timeout")
+func isTLSHandshakeTimeoutLink(link error) bool {
+	return strings.Contains(link.Error(), "TLS handshake timeout")
 }
 
-func isReadWriteError(err error) bool {
-	var opErr *net.OpError
-	return errors.As(err, &opErr) && (opErr.Op == "read" || opErr.Op == "write")
+func isDNSLink(link error) bool {
+	_, ok := link.(*net.DNSError)
+	return ok
 }
 
-func isTLSError(err error) bool {
+func isIOLink(link error) bool {
+	if linkIs(link, io.ErrUnexpectedEOF) || linkIs(link, io.EOF) {
+		return true
+	}
+	return opLink(link, "read") || opLink(link, "write")
+}
+
+func isTLSLink(link error) bool {
 	// net/http REPLACES the tls.RecordHeaderError with this sentinel when a
 	// plaintext server answers an HTTPS client, so the typed TLS error is
 	// gone by the time the SDK sees it and only the sentinel identifies the
 	// failure. trusted-router-py sees an ssl.SSLError for the same server and
 	// classifies it "tls"; without this check the class was "unknown".
-	if errors.Is(err, http.ErrSchemeMismatch) {
+	if linkIs(link, http.ErrSchemeMismatch) {
 		return true
 	}
-	var (
-		certVerification *tls.CertificateVerificationError
-		recordHeader     tls.RecordHeaderError
-		alert            tls.AlertError
-		unknownAuthority x509.UnknownAuthorityError
-		hostnameErr      x509.HostnameError
-		certInvalid      x509.CertificateInvalidError
-	)
-	return errors.As(err, &certVerification) ||
-		errors.As(err, &recordHeader) ||
-		errors.As(err, &alert) ||
-		errors.As(err, &unknownAuthority) ||
-		errors.As(err, &hostnameErr) ||
-		errors.As(err, &certInvalid)
+	switch link.(type) {
+	case *tls.CertificateVerificationError,
+		tls.RecordHeaderError,
+		tls.AlertError,
+		x509.UnknownAuthorityError,
+		x509.HostnameError,
+		x509.CertificateInvalidError:
+		return true
+	}
+	return false
 }
 
-// isProtocolError sniffs the HTTP-protocol failures net/http surfaces only
-// as strings: the bundled http2 transport's errors and HTTP/1.x response
-// parse failures have no exported types to errors.As against.
+// isProtocolLink sniffs the HTTP-protocol failures net/http surfaces only as
+// strings: the bundled http2 transport's errors and HTTP/1.x response parse
+// failures have no exported types to match on.
 //
-// The two "…error: stream ID"/"connection error:" forms are how the bundled
-// http2 StreamError and ConnectionError actually render (h2_bundle.go
-// formats them as "stream error: stream ID %d; %v" and "connection error:
-// %s"). Neither string contains "http2", so a peer resetting a stream — the
-// commonest real HTTP/2 failure, e.g. "stream error: stream ID 1;
-// INTERNAL_ERROR; received from peer" — used to classify as "unknown".
-// trusted-router-py sees httpx.RemoteProtocolError for these and reports
-// protocol_error. The reset/io classes are checked before this function, so
-// matching on these substrings cannot steal a more specific class.
-func isProtocolError(err error) bool {
-	message := err.Error()
+// The stream/connection forms are how the bundled http2 StreamError and
+// ConnectionError actually render (h2_bundle.go formats them as "stream
+// error: stream ID %d; %v" and "connection error: %s"). Neither string
+// contains "http2", so a peer resetting a stream — the commonest real HTTP/2
+// failure, "stream error: stream ID 1; INTERNAL_ERROR; received from peer" —
+// classified as "unknown" before they were added. trusted-router-py sees
+// httpx.RemoteProtocolError for these and reports protocol_error.
+//
+// They are matched as PREFIXES of the individual link, not as substrings of
+// the whole flattened chain: an outer *net.OpError inherits the text of what
+// it wraps, so a substring test on the outer message would let this steal
+// io_error from a read/write op that happens to wrap one of these.
+func isProtocolLink(link error) bool {
+	message := link.Error()
 	return strings.Contains(message, "http2") ||
 		strings.Contains(message, "HTTP/2") ||
 		strings.Contains(message, "malformed HTTP") ||
 		strings.Contains(message, "PROTOCOL_ERROR") ||
-		strings.Contains(message, "stream error: stream ID") ||
-		strings.Contains(message, "connection error:")
+		strings.HasPrefix(message, "stream error: stream ID ") ||
+		strings.HasPrefix(message, "connection error: ")
 }
 
 func clampDurationMS(d time.Duration) int64 {
@@ -455,7 +542,10 @@ func (r *requestRecorder) onTransportError(err error, openTimedOut bool) {
 	var outcome, errorClass string
 	if openTimedOut {
 		outcome = "timeout"
-		if isDialError(err) {
+		// Bounded chain here too: this runs on the same caller-supplied
+		// error value as classifyTransportError, so it must not traverse
+		// with errors.As either.
+		if chainHas(telemetryErrorChain(err), isDialOpLink) {
 			errorClass = "connect_timeout"
 		} else {
 			errorClass = "read_timeout"

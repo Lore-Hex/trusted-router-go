@@ -1170,6 +1170,21 @@ func TestTelemetryHostAllowlistMatchesSDKConstants(t *testing.T) {
 	if len(AliasAPIBaseURLs) != 2 {
 		t.Fatalf("AliasAPIBaseURLs has %d entries; telemetry's host vocabulary (ally, uptime) must be updated with it", len(AliasAPIBaseURLs))
 	}
+	// The exact key set, not just the expected entries: a test that only
+	// checks the hosts it knows about would pass with an extra
+	// "gateway.attacker.example": "apex" sitting in the map, which is the
+	// whole exposure this list exists to close.
+	wantHostnames := map[string]string{
+		"api.trustedrouter.com":            "apex",
+		"api.allyrouter.com":               "ally",
+		"api.uptimerouter.com":             "uptime",
+		"api-us-central1.quillrouter.com":  "us_central1",
+		"api-us-east4.quillrouter.com":     "us_east4",
+		"api-europe-west4.quillrouter.com": "europe_west4",
+	}
+	if !reflect.DeepEqual(telemetryHostnames, wantHostnames) {
+		t.Errorf("telemetryHostnames = %#v, want exactly %#v", telemetryHostnames, wantHostnames)
+	}
 	for _, tc := range []struct{ url, want string }{
 		{DefaultAPIBaseURL, "apex"},
 		{AliasAPIBaseURLs[0], "ally"},
@@ -1306,5 +1321,111 @@ func TestLostAttemptRecordDoesNotRewindTheAttemptIndex(t *testing.T) {
 		if fields["a"] != strconv.Itoa(attempt) {
 			t.Errorf("attempt %d x-tr-client = %q, which reports a=%s: a dropped record must not rewind the attempt index", attempt, header, fields["a"])
 		}
+	}
+}
+
+// selfUnwrappingError is a caller-injected error whose Unwrap returns itself.
+// errors.Is and errors.As have no cycle detection and no depth bound, so any
+// classification built on them spins forever on this value — the request that
+// was about to be retried is never sent, and the caller's context cannot
+// interrupt a synchronous loop.
+type selfUnwrappingError struct{}
+
+func (selfUnwrappingError) Error() string   { return "cyclic transport error" }
+func (e selfUnwrappingError) Unwrap() error { return e }
+
+// deepUnwrappingError builds a chain longer than the bound, to prove the walk
+// stops counting rather than merely surviving cycles.
+type deepUnwrappingError struct{ depth int }
+
+func (e deepUnwrappingError) Error() string { return "deep transport error" }
+func (e deepUnwrappingError) Unwrap() error {
+	if e.depth == 0 {
+		return nil
+	}
+	return deepUnwrappingError{depth: e.depth - 1}
+}
+
+func TestErrorChainWalkIsBounded(t *testing.T) {
+	if got := len(telemetryErrorChain(selfUnwrappingError{})); got != telemetryMaxErrorChainLinks {
+		t.Fatalf("cyclic chain length = %d, want the bound %d", got, telemetryMaxErrorChainLinks)
+	}
+	if got := len(telemetryErrorChain(deepUnwrappingError{depth: 100})); got != telemetryMaxErrorChainLinks {
+		t.Fatalf("deep chain length = %d, want the bound %d", got, telemetryMaxErrorChainLinks)
+	}
+	if got := len(telemetryErrorChain(errors.New("flat"))); got != 1 {
+		t.Fatalf("flat chain length = %d, want 1", got)
+	}
+	if got := len(telemetryErrorChain(nil)); got != 0 {
+		t.Fatalf("nil chain length = %d, want 0", got)
+	}
+	// A joined error's branches are followed, and are also bounded.
+	joined := errors.Join(errors.New("a"), errors.New("b"))
+	if got := len(telemetryErrorChain(joined)); got != 3 {
+		t.Fatalf("joined chain length = %d, want 3 (the join plus two branches)", got)
+	}
+	if got := classifyTransportError(selfUnwrappingError{}); got != "unknown" {
+		t.Fatalf("classifyTransportError(cyclic) = %q, want %q", got, "unknown")
+	}
+}
+
+// TestCyclicErrorChainCannotHangTheRequest is the failure-isolation test for
+// the bounded walk. §2.2 says telemetry may never fail a request, and hanging
+// one is the worst way to fail it: a recovered panic costs a telemetry record,
+// but an unbounded traversal costs the caller their request, with no error and
+// no way out.
+func TestCyclicErrorChainCannotHangTheRequest(t *testing.T) {
+	clearTelemetryEnv(t)
+	defer stubSleep(func(context.Context, time.Duration) error { return nil })()
+
+	calls := 0
+	sdk, err := NewClient(Options{APIKey: "k", HTTPClient: newRoundTripClient(func(r *http.Request) (*http.Response, error) {
+		calls++
+		if calls == 1 {
+			return nil, selfUnwrappingError{}
+		}
+		return jsonResponse(http.StatusOK, map[string]any{"ok": true}, nil), nil
+	})})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		var out map[string]any
+		done <- sdk.Request(context.Background(), http.MethodGet, "/models", nil, &out, nil)
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		if calls != 2 {
+			t.Fatalf("attempts = %d, want 2 (the retry must still happen)", calls)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("request never returned: telemetry classification is traversing the error chain without a bound")
+	}
+}
+
+// TestReadOpErrorIsNotStolenByTheProtocolMatch pins the precedence between
+// io_error and protocol_error. An outer *net.OpError inherits the message of
+// the error it wraps, so a read op wrapping anything that renders like an
+// http2 frame error must still be io_error: the op is the more specific fact,
+// and the protocol test only recognizes those renderings at the START of a
+// link's own message.
+func TestReadOpErrorIsNotStolenByTheProtocolMatch(t *testing.T) {
+	readOp := &net.OpError{
+		Op:     "read",
+		Net:    "tcp",
+		Source: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1234},
+		Err:    errors.New("connection error: INTERNAL_ERROR"),
+	}
+	if got := classifyTransportError(readOp); got != "io_error" {
+		t.Fatalf("classifyTransportError(read op wrapping http2-looking text) = %q, want %q", got, "io_error")
+	}
+	// The genuine article, on its own link, still classifies as protocol_error.
+	if got := classifyTransportError(errors.New("connection error: PROTOCOL_ERROR")); got != "protocol_error" {
+		t.Fatalf("classifyTransportError(http2 connection error) = %q, want %q", got, "protocol_error")
 	}
 }
