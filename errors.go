@@ -180,8 +180,29 @@ func errorString(payload any, key string) string {
 func transportRetryError(err error) error {
 	return &InternalError{embeddedError: &Error{
 		StatusCode: http.StatusServiceUnavailable,
-		Message:    fmt.Sprintf("TrustedRouter endpoint unavailable: %s", err),
+		Message:    "TrustedRouter endpoint unavailable: " + safeErrorMessage(err),
 	}}
+}
+
+// safeErrorMessage flattens a transport error into a bounded string.
+//
+// The error value can come from a caller-injected http.Client
+// (Options.HTTPClient is used verbatim), so its Error method is arbitrary
+// code: an instrumentation wrapper whose Error panics would otherwise
+// crash the caller's process at the exact moment the SDK is trying to
+// report retry exhaustion, instead of surfacing the typed SDK error. A
+// hostile message is also capped so one pathological value cannot balloon
+// the SDK error.
+func safeErrorMessage(err error) (message string) {
+	defer func() {
+		if recover() != nil {
+			message = "unprintable transport error"
+		}
+	}()
+	if err == nil {
+		return "unknown transport error"
+	}
+	return truncateString(err.Error(), 2048)
 }
 
 func decodeResponse(ctx context.Context, resp *http.Response, out any) error {
