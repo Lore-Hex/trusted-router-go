@@ -148,7 +148,7 @@ func (u MessagesUsage) MarshalJSON() ([]byte, error) {
 // Messages sends an Anthropic-compatible /messages request.
 func (c *Client) Messages(ctx context.Context, req MessagesRequest) (*MessageResponse, error) {
 	var out MessageResponse
-	callOpts := req.CallOptions
+	callOpts := ensureIdempotencyKey(req.CallOptions)
 	if err := c.Request(ctx, http.MethodPost, "/messages", buildMessagesBody(req), &out, &callOpts); err != nil {
 		return nil, err
 	}

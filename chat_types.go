@@ -413,105 +413,186 @@ func CollectCompletion(chunks []ChatCompletionChunk) *ChatCompletion {
 		}
 	}
 
-	var textParts []string
-	var finishReason *string
-	role := "assistant"
 	var usage *ChatUsage
 	trustedrouter := collectTrustedRouterMetadata(chunks)
-	toolCalls := map[int]map[string]any{}
+	states := map[int]*completionChoiceState{}
+	result := &ChatCompletion{Object: "chat.completion"}
+	resultExtra := map[string]any{}
 
 	for _, chunk := range chunks {
+		if chunk.ID != "" {
+			result.ID = chunk.ID
+		}
+		if chunk.Created != 0 {
+			result.Created = chunk.Created
+		}
+		if chunk.Model != "" {
+			result.Model = chunk.Model
+		}
 		if chunk.Usage != nil {
 			usage = chunk.Usage
 		}
-		if len(chunk.Choices) == 0 {
-			continue
+		for key, value := range chunk.Extra {
+			resultExtra[key] = value
 		}
-		choice := chunk.Choices[0]
-		if choice.Delta.Role != nil {
-			role = *choice.Delta.Role
-		}
-		if choice.Delta.Content != nil {
-			textParts = append(textParts, *choice.Delta.Content)
-		}
-		for _, tc := range choice.Delta.ToolCalls {
-			idx := toolCallIndex(tc)
-			slot, ok := toolCalls[idx]
+		for _, choice := range chunk.Choices {
+			state, ok := states[choice.Index]
 			if !ok {
-				slot = map[string]any{
-					"index": idx,
-					"type":  "function",
-					"function": map[string]any{
-						"name":      "",
-						"arguments": "",
-					},
+				state = &completionChoiceState{
+					index:        choice.Index,
+					role:         "assistant",
+					toolCalls:    map[int]map[string]any{},
+					messageExtra: map[string]any{},
+					choiceExtra:  map[string]any{},
 				}
-				toolCalls[idx] = slot
+				states[choice.Index] = state
 			}
-			if id, ok := nonEmptyString(tc["id"]); ok {
-				slot["id"] = id
+			if choice.Delta.Role != nil {
+				state.role = *choice.Delta.Role
 			}
-			if typ, ok := nonEmptyString(tc["type"]); ok {
-				slot["type"] = typ
+			if choice.Delta.Content != nil {
+				state.textParts = append(state.textParts, *choice.Delta.Content)
 			}
-			if fn, ok := tc["function"].(map[string]any); ok {
-				slotFn, _ := slot["function"].(map[string]any)
-				if name, ok := nonEmptyString(fn["name"]); ok {
-					slotFn["name"] = name
+			for key, value := range choice.Delta.Extra {
+				mergeCompletionField(state.messageExtra, key, value)
+			}
+			for key, value := range choice.Extra {
+				mergeCompletionField(state.choiceExtra, key, value)
+			}
+			for _, tc := range choice.Delta.ToolCalls {
+				idx := toolCallIndex(tc)
+				slot, ok := state.toolCalls[idx]
+				if !ok {
+					slot = map[string]any{
+						"index": idx,
+						"type":  "function",
+						"function": map[string]any{
+							"name":      "",
+							"arguments": "",
+						},
+					}
+					state.toolCalls[idx] = slot
 				}
-				if args, ok := fn["arguments"].(string); ok {
-					existing, _ := slotFn["arguments"].(string)
-					slotFn["arguments"] = existing + args
+				if id, ok := nonEmptyString(tc["id"]); ok {
+					slot["id"] = id
+				}
+				if typ, ok := nonEmptyString(tc["type"]); ok {
+					slot["type"] = typ
+				}
+				if fn, ok := tc["function"].(map[string]any); ok {
+					slotFn, _ := slot["function"].(map[string]any)
+					if name, ok := nonEmptyString(fn["name"]); ok {
+						slotFn["name"] = name
+					}
+					if args, ok := fn["arguments"].(string); ok {
+						existing, _ := slotFn["arguments"].(string)
+						slotFn["arguments"] = existing + args
+					}
 				}
 			}
-		}
-		if choice.FinishReason != nil && *choice.FinishReason != "" {
-			value := *choice.FinishReason
-			finishReason = &value
+			if choice.FinishReason != nil && *choice.FinishReason != "" {
+				value := *choice.FinishReason
+				state.finishReason = &value
+			}
 		}
 	}
 
-	content := strings.Join(textParts, "")
-	message := ChatMessage{Role: role}
-	if content != "" {
-		message.Content = &content
-	} else if len(toolCalls) == 0 {
-		empty := ""
-		message.Content = &empty
-	}
-	if len(toolCalls) > 0 {
-		indexes := make([]int, 0, len(toolCalls))
-		for idx := range toolCalls {
-			indexes = append(indexes, idx)
-		}
-		sort.Ints(indexes)
-		message.ToolCalls = make([]map[string]any, 0, len(indexes))
-		for _, idx := range indexes {
-			message.ToolCalls = append(message.ToolCalls, toolCalls[idx])
+	if len(states) == 0 {
+		states[0] = &completionChoiceState{
+			index: 0, role: "assistant", toolCalls: map[int]map[string]any{},
+			messageExtra: map[string]any{}, choiceExtra: map[string]any{},
 		}
 	}
-
-	if finishReason == nil {
-		value := "stop"
-		finishReason = &value
+	choiceIndexes := make([]int, 0, len(states))
+	for index := range states {
+		choiceIndexes = append(choiceIndexes, index)
 	}
-	last := chunks[len(chunks)-1]
-	result := &ChatCompletion{
-		ID:      last.ID,
-		Object:  "chat.completion",
-		Created: last.Created,
-		Model:   last.Model,
-		Choices: []ChatChoice{{
-			Index:        0,
-			Message:      message,
-			FinishReason: finishReason,
-		}},
-		Usage: usage,
+	sort.Ints(choiceIndexes)
+	result.Choices = make([]ChatChoice, 0, len(choiceIndexes))
+	for _, choiceIndex := range choiceIndexes {
+		state := states[choiceIndex]
+		content := strings.Join(state.textParts, "")
+		message := ChatMessage{Role: state.role, Extra: state.messageExtra}
+		if content != "" {
+			message.Content = &content
+		} else if len(state.toolCalls) == 0 {
+			empty := ""
+			message.Content = &empty
+		}
+		if len(state.toolCalls) > 0 {
+			toolIndexes := make([]int, 0, len(state.toolCalls))
+			for index := range state.toolCalls {
+				toolIndexes = append(toolIndexes, index)
+			}
+			sort.Ints(toolIndexes)
+			message.ToolCalls = make([]map[string]any, 0, len(toolIndexes))
+			for _, index := range toolIndexes {
+				message.ToolCalls = append(message.ToolCalls, state.toolCalls[index])
+			}
+		}
+		if state.finishReason == nil {
+			value := "stop"
+			state.finishReason = &value
+		}
+		choice := ChatChoice{
+			Index: choiceIndex, Message: message, FinishReason: state.finishReason,
+			Extra: state.choiceExtra,
+		}
+		if logprobs, ok := state.choiceExtra["logprobs"].(map[string]any); ok {
+			choice.Logprobs = logprobs
+			delete(choice.Extra, "logprobs")
+		}
+		result.Choices = append(result.Choices, choice)
 	}
+	result.Usage = usage
 	if trustedrouter != nil {
-		result.Extra = map[string]any{"trustedrouter": trustedrouter}
+		resultExtra["trustedrouter"] = trustedrouter
+	}
+	if len(resultExtra) > 0 {
+		result.Extra = resultExtra
 	}
 	return result
+}
+
+type completionChoiceState struct {
+	index        int
+	role         string
+	textParts    []string
+	finishReason *string
+	toolCalls    map[int]map[string]any
+	messageExtra map[string]any
+	choiceExtra  map[string]any
+}
+
+func mergeCompletionField(target map[string]any, key string, value any) {
+	if value == nil {
+		return
+	}
+	existing, present := target[key]
+	if !present {
+		target[key] = value
+		return
+	}
+	switch next := value.(type) {
+	case string:
+		if prior, ok := existing.(string); ok {
+			target[key] = prior + next
+			return
+		}
+	case []any:
+		if prior, ok := existing.([]any); ok {
+			target[key] = append(prior, next...)
+			return
+		}
+	case map[string]any:
+		if prior, ok := existing.(map[string]any); ok {
+			for nestedKey, nestedValue := range next {
+				mergeCompletionField(prior, nestedKey, nestedValue)
+			}
+			return
+		}
+	}
+	target[key] = value
 }
 
 func collectTrustedRouterMetadata(chunks []ChatCompletionChunk) map[string]any {

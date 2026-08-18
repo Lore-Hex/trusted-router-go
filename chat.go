@@ -171,7 +171,7 @@ func (c *Client) openEventStream(ctx context.Context, method, path string, body 
 	if err != nil {
 		return nil, err
 	}
-	if resp.StatusCode >= 400 {
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return nil, raiseForStreamResponse(resp)
 	}
 	return resp, nil

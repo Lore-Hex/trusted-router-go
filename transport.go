@@ -29,7 +29,7 @@ package trustedrouter
 // TestALabelledRetryableStatusIsRetriedOnStreamOpen.
 // (5) Idempotency key minted once per logical call before the loop and
 // re-sent verbatim across every attempt and domain move — the caller is never
-// double-charged (idempotent auth + exactly-once settlement) —
+// double-charged (exactly-once settlement) —
 // TestRegionalFailoverAndChatIdempotency.
 // (6) Retries happen only before any body bytes are surfaced; a broken open
 // stream propagates, never reconnects — TestChatStreamMidReadErrorIsWrapped,
@@ -37,9 +37,11 @@ package trustedrouter
 // (7) The failover flag governs WHERE, never WHETHER — a pinned client still
 // retries in place — TestPinnedClientStillRetriesInPlace,
 // TestPinnedStreamRetriesInPlace.
-// (8) Transport errors (no server saw the request) may always move hosts
-// within the flag gating; HTTP moves additionally require a failoverable
-// status — TestTransportExhaustionWalksAllCandidates.
+// (8) Transport errors are ambiguous about whether a server accepted the
+// request. They retry and may move hosts only when the method or idempotency
+// key makes replay safe; HTTP moves additionally require a failoverable status
+// — TestTransportExhaustionWalksAllCandidates,
+// TestGenericUnsafeTransportFailureIsNotRetriedWithoutIdempotency.
 // (9) Terminal asymmetries are per-SDK contract and survive verbatim:
 // exhausted-status RETURNS the response for the caller to classify
 // (TestRequestRetryAndErrorBehavior/retries_exhausted_returns_last_error)
@@ -55,20 +57,24 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"io"
 	mathrand "math/rand"
 	"net/http"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 var (
-	errOpenTimeout       = errors.New("trustedrouter stream open timeout")
-	errStreamIdleTimeout = errors.New("trustedrouter stream idle timeout")
+	errOpenTimeout              = errors.New("trustedrouter stream open timeout")
+	errStreamIdleTimeout        = errors.New("trustedrouter stream idle timeout")
+	idempotencyFallbackSequence atomic.Uint64
 )
 
 // requestSpec describes one logical call for the transport engine. The
@@ -84,6 +90,7 @@ type requestSpec struct {
 	failover        bool
 	streamOpen      bool
 	autoIdempotency bool
+	credentialFree  bool
 	// controlPlane marks a control-plane call: client telemetry records
 	// nothing and sends no x-tr-client header for those (contract §3.2).
 	controlPlane bool
@@ -153,14 +160,18 @@ func (c *Client) do(ctx context.Context, spec requestSpec) (*http.Response, erro
 		}
 
 		recorder.beginAttempt(spec.candidates[baseIndex])
-		req, err := c.newHTTPRequest(attemptCtx, spec.method, joinURL(spec.candidates[baseIndex], spec.path), spec.body, spec.hasBody, spec.opts, recorder)
+		req, err := c.newHTTPRequest(attemptCtx, spec.method, joinURL(spec.candidates[baseIndex], spec.path), spec.body, spec.hasBody, spec.opts, recorder, spec.credentialFree)
 		if err != nil {
 			stopTimer(openTimer)
 			cancelAttempt()
 			return nil, err
 		}
 
-		resp, err := c.httpClient.Do(req)
+		httpClient := c.httpClient
+		if spec.credentialFree {
+			httpClient = c.credentialFreeHTTPClient
+		}
+		resp, err := httpClient.Do(req)
 		// The open timer covers exactly the wait for response headers.
 		stopTimer(openTimer)
 		if err != nil {
@@ -176,15 +187,15 @@ func (c *Client) do(ctx context.Context, spec requestSpec) (*http.Response, erro
 			if openTimedOut {
 				err = errOpenTimeout
 			}
-			if attempt >= c.maxRetries {
+			if attempt >= c.maxRetries || !requestReplaySafe(spec.method, spec.opts) {
 				cancelAttempt()
 				return nil, transportRetryError(err)
 			}
 			cancelAttempt()
-			// A dial/transport failure means no server saw the request, so
-			// moving to another domain cannot double-execute anything.
-			// The failover flag governs only that move; a pinned client still
-			// retries, it just stays on the host the caller named.
+			// A transport error may happen before or after a server accepted the
+			// body. The replay-safety gate above is therefore mandatory before
+			// either retrying or moving. The failover flag governs only WHERE a
+			// safe retry goes; a pinned client retries on the named host.
 			if spec.failover && baseIndex < len(spec.candidates)-1 {
 				baseIndex++
 				recorder.onMoved()
@@ -197,7 +208,7 @@ func (c *Client) do(ctx context.Context, spec requestSpec) (*http.Response, erro
 		}
 
 		recorder.onResponse(resp.StatusCode)
-		if attempt >= c.maxRetries || !retryable(resp.StatusCode, resp.Header) {
+		if attempt >= c.maxRetries || !retryable(resp.StatusCode, resp.Header) || !requestReplaySafe(spec.method, spec.opts) {
 			if spec.streamOpen {
 				if hasTimeout {
 					resp.Body = newStreamIdleTimeoutReadCloser(resp.Body, attemptCtx, cancelStream, timeout)
@@ -243,10 +254,10 @@ func (c *Client) absoluteRequest(ctx context.Context, method, requestURL string)
 		req.Header.Set(key, value)
 	}
 	req.Header.Set("user-agent", userAgent())
-	// x-tr-client is SDK-reserved (§3.2): these credential-free one-shot
-	// fetches never carry it, even a stale caller-configured value.
-	req.Header.Del("x-tr-client")
-	resp, err := c.httpClient.Do(req)
+	// Public metadata is credential-free even when the caller configured
+	// credential-shaped default headers on the SDK client.
+	stripCredentialHeaders(req.Header)
+	resp, err := c.credentialFreeHTTPClient.Do(req)
 	if err != nil {
 		cancel()
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -284,7 +295,7 @@ func marshalRequestBody(body any) ([]byte, bool, error) {
 	return data, true, nil
 }
 
-func (c *Client) newHTTPRequest(ctx context.Context, method, url string, bodyBytes []byte, hasBody bool, opts *CallOptions, recorder *requestRecorder) (*http.Request, error) {
+func (c *Client) newHTTPRequest(ctx context.Context, method, url string, bodyBytes []byte, hasBody bool, opts *CallOptions, recorder *requestRecorder, credentialFree bool) (*http.Request, error) {
 	var body io.Reader
 	if hasBody {
 		body = bytes.NewReader(bodyBytes)
@@ -317,9 +328,15 @@ func (c *Client) newHTTPRequest(ctx context.Context, method, url string, bodyByt
 		req.Header.Set("x-trustedrouter-workspace", workspaceID)
 	}
 
+	// Authorization is SDK-owned. Delete any default/per-call raw value first
+	// so an empty APIKey override really suppresses it (notably for OAuth).
+	req.Header.Del("authorization")
 	apiKey := c.apiKey
 	if opts != nil && opts.APIKey != nil {
 		apiKey = *opts.APIKey
+	}
+	if opts != nil && opts.APIKey != nil && *opts.APIKey == "" {
+		stripAuthenticationHeaders(req.Header)
 	}
 	if apiKey != "" {
 		req.Header.Set("authorization", "Bearer "+apiKey)
@@ -335,6 +352,9 @@ func (c *Client) newHTTPRequest(ctx context.Context, method, url string, bodyByt
 		if value := recorder.headerValue(); value != "" {
 			req.Header.Set("x-tr-client", value)
 		}
+	}
+	if credentialFree {
+		stripCredentialHeaders(req.Header)
 	}
 	return req, nil
 }
@@ -361,11 +381,100 @@ func userAgent() string {
 // endpoint that mints does so through this function, exactly once per logical
 // call, before the transport loop starts.
 func newIdempotencyKey() string {
+	return newIdempotencyKeyWithEntropy(rand.Reader)
+}
+
+func newIdempotencyKeyWithEntropy(entropy io.Reader) string {
 	var b [24]byte
-	if _, err := rand.Read(b[:]); err == nil {
+	if _, err := io.ReadFull(entropy, b[:]); err == nil {
 		return "tr-req-" + base64.RawURLEncoding.EncodeToString(b[:])
 	}
-	return "tr-req-" + base64.RawURLEncoding.EncodeToString([]byte(time.Now().Format(time.RFC3339Nano)))
+	// rand.Reader failures must not make request construction fail. The
+	// process ID, nanosecond timestamp, and atomic sequence make this fallback
+	// unique for concurrent calls in one process and collision-resistant across
+	// independently started clients.
+	binary.BigEndian.PutUint64(b[0:8], uint64(time.Now().UnixNano()))
+	binary.BigEndian.PutUint64(b[8:16], uint64(os.Getpid()))
+	binary.BigEndian.PutUint64(b[16:24], idempotencyFallbackSequence.Add(1))
+	return "tr-req-" + base64.RawURLEncoding.EncodeToString(b[:])
+}
+
+func ensureIdempotencyKey(opts CallOptions) CallOptions {
+	if opts.IdempotencyKey == "" {
+		opts.IdempotencyKey = newIdempotencyKey()
+	}
+	return opts
+}
+
+func ensureIdempotencyOptions(opts *CallOptions) *CallOptions {
+	var copy CallOptions
+	if opts != nil {
+		copy = *opts
+	}
+	copy = ensureIdempotencyKey(copy)
+	return &copy
+}
+
+func requestReplaySafe(method string, opts *CallOptions) bool {
+	switch strings.ToUpper(method) {
+	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:
+		return true
+	default:
+		return opts != nil && opts.IdempotencyKey != ""
+	}
+}
+
+func cloneHTTPClientWithRedirectProtection(client *http.Client) *http.Client {
+	var protected http.Client
+	if client != nil {
+		// A shallow copy preserves the caller's Transport, Jar, Timeout, and
+		// other configuration without mutating shared client state.
+		protected = *client
+	}
+	// The retry engine, not net/http, owns every physical attempt. Returning
+	// the 3xx response also prevents prompt bodies and SDK headers from being
+	// replayed to a Location on another origin.
+	protected.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	return &protected
+}
+
+func cloneCredentialFreeHTTPClient(client *http.Client) *http.Client {
+	credentialFree := *client
+	// A standard-library cookie Jar mutates outgoing requests inside Client.Do,
+	// after SDK header assembly. Removing it on this private clone keeps public
+	// metadata and OAuth exchange credential-free without changing the caller's
+	// client or the Jar used for ordinary API requests.
+	credentialFree.Jar = nil
+	return &credentialFree
+}
+
+func stripCredentialHeaders(headers http.Header) {
+	for _, name := range []string{
+		"authorization",
+		"proxy-authorization",
+		"cookie",
+		"cookie2",
+		"x-api-key",
+		"x-trustedrouter-workspace",
+		"idempotency-key",
+		"x-tr-client",
+	} {
+		headers.Del(name)
+	}
+}
+
+func stripAuthenticationHeaders(headers http.Header) {
+	for _, name := range []string{
+		"authorization",
+		"proxy-authorization",
+		"cookie",
+		"cookie2",
+		"x-api-key",
+	} {
+		headers.Del(name)
+	}
 }
 
 func retrySleepDuration(attempt int, retryAfter *float64) time.Duration {

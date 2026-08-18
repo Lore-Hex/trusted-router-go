@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -53,6 +54,9 @@ func TestBillingCheckoutWireShape(t *testing.T) {
 	if _, err := client.StablecoinCheckout(context.Background(), BillingCheckoutRequest{Amount: 42}); err != nil {
 		t.Fatal(err)
 	}
+	if len(seen) != 2 || !strings.HasPrefix(seen[1].idempotencyKey, "tr-req-") {
+		t.Fatalf("generated stablecoin idempotency key = %q", seen[1].idempotencyKey)
+	}
 
 	want := []seenRequest{
 		{
@@ -69,10 +73,11 @@ func TestBillingCheckoutWireShape(t *testing.T) {
 			},
 		},
 		{
-			method:    http.MethodPost,
-			path:      "/billing/checkout",
-			workspace: "client-workspace",
-			body:      map[string]any{"amount": float64(42), "payment_method": "stablecoin"},
+			method:         http.MethodPost,
+			path:           "/billing/checkout",
+			workspace:      "client-workspace",
+			idempotencyKey: seen[1].idempotencyKey,
+			body:           map[string]any{"amount": float64(42), "payment_method": "stablecoin"},
 		},
 	}
 	if !reflect.DeepEqual(seen, want) {

@@ -88,7 +88,7 @@ func TestDefaultInferenceAndControlHostsByMethod(t *testing.T) {
 			case "/v1/billing/checkout":
 				return jsonResponse(http.StatusOK, map[string]any{"url": "https://checkout.example/session"}, nil), nil
 			case "/v1/chat/completions":
-				return textResponse(http.StatusOK, `data: {"id":"chat_1","choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}`+"\n\n", http.Header{"Content-Type": []string{"text/event-stream"}}), nil
+				return textResponse(http.StatusOK, `data: {"id":"chat_1","choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}`+"\n\ndata: [DONE]\n\n", http.Header{"Content-Type": []string{"text/event-stream"}}), nil
 			case "/v1/messages":
 				return jsonResponse(http.StatusOK, map[string]any{
 					"id":      "msg_1",
@@ -276,13 +276,29 @@ func TestClientTimeoutDefaultsAndIntrospection(t *testing.T) {
 		t.Fatalf("explicit zero sdk timeout = %v", client.timeout)
 	}
 
-	supplied := &http.Client{Timeout: 17 * time.Second}
+	callerRedirectUsed := false
+	supplied := &http.Client{
+		Timeout: 17 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			callerRedirectUsed = true
+			return nil
+		},
+	}
 	client, err = NewClient(Options{HTTPClient: supplied, Timeout: &noTimeout})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if client.httpClient != supplied || client.httpClient.Timeout != 17*time.Second {
+	if client.httpClient == supplied || client.httpClient.Timeout != 17*time.Second {
 		t.Fatalf("supplied client not respected: %#v", client.httpClient)
+	}
+	if err := client.httpClient.CheckRedirect(nil, nil); !errors.Is(err, http.ErrUseLastResponse) {
+		t.Fatalf("SDK redirect policy = %v", err)
+	}
+	if callerRedirectUsed {
+		t.Fatal("SDK invoked the caller redirect policy")
+	}
+	if err := supplied.CheckRedirect(nil, nil); err != nil || !callerRedirectUsed {
+		t.Fatalf("caller client was mutated: err=%v used=%t", err, callerRedirectUsed)
 	}
 }
 
@@ -333,7 +349,7 @@ func TestCallOptionsAPIKeyAndWorkspacePointerSemantics(t *testing.T) {
 	if got := seen[1].Get("x-trustedrouter-workspace"); got != "" {
 		t.Fatalf("suppressed workspace = %q", got)
 	}
-	if got := seen[2].Get("authorization"); got != "Bearer extra" {
+	if got := seen[2].Get("authorization"); got != "" {
 		t.Fatalf("extra authorization after suppression = %q", got)
 	}
 	if got := seen[2].Get("x-trustedrouter-workspace"); got != "extra-workspace" {
@@ -717,8 +733,9 @@ func TestRequestRetryAndErrorBehavior(t *testing.T) {
 
 // Renamed from TestTransportExhaustionRetriesApex. It asserted all three
 // attempts re-hit the apex, which is what a one-entry candidate list forced —
-// the name documented a no-op as the intended behaviour. A dial failure means
-// no server saw the request, so exhausting the candidates is the correct walk.
+// the name documented a no-op as the intended behaviour. This fixture fails in
+// the injected dial path before a server is reached, so exhausting candidates
+// is the correct walk.
 func TestTransportExhaustionWalksAllCandidates(t *testing.T) {
 	restore := stubSleep(func(context.Context, time.Duration) error { return nil })
 	defer restore()
@@ -767,7 +784,7 @@ func TestRegionalFailoverAndChatIdempotency(t *testing.T) {
 			if len(seenHosts) == 1 {
 				return textResponse(503, "regional gateway unavailable", nil), nil
 			}
-			return textResponse(200, `data: {"choices":[{"delta":{"content":"OK"},"finish_reason":"stop"}]}`+"\n\n", http.Header{"Content-Type": []string{"text/event-stream"}}), nil
+			return textResponse(200, `data: {"choices":[{"delta":{"content":"OK"},"finish_reason":"stop"}]}`+"\n\ndata: [DONE]\n\n", http.Header{"Content-Type": []string{"text/event-stream"}}), nil
 		}),
 	})
 	if err != nil {

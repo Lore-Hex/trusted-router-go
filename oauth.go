@@ -191,7 +191,7 @@ func (c *Client) ExchangeOAuthKey(ctx context.Context, req OAuthKeyExchangeReque
 	emptyAPIKey := ""
 	callOpts := CallOptions{APIKey: &emptyAPIKey, Timeout: req.Timeout}
 	var out OAuthKeyExchangeResponse
-	if err := c.controlRequest(ctx, http.MethodPost, "/auth/keys", body, &out, &callOpts); err != nil {
+	if err := c.credentialFreeControlRequest(ctx, http.MethodPost, "/auth/keys", body, &out, &callOpts); err != nil {
 		return nil, err
 	}
 	return &out, nil

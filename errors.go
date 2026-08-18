@@ -197,7 +197,7 @@ func transportRetryError(err error) error {
 // the SDK's single flattening point for a transport error.
 //
 // The value is arbitrary code whenever the caller injects an http.Client
-// (Options.HTTPClient is used verbatim), so flattening it is a call into
+// (the SDK clone preserves its RoundTripper), so flattening it is a call into
 // code the SDK does not control, at the exact moment the SDK is trying to
 // report a failure.
 //
@@ -249,7 +249,7 @@ func decodeResponse(ctx context.Context, resp *http.Response, out any) error {
 		}
 		return err
 	}
-	if resp.StatusCode >= 400 {
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		payload, ok := parseJSONPayload(body)
 		if !ok {
 			return classifyError(resp.StatusCode, truncateString(string(body), 240), nil, resp.Header)

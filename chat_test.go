@@ -16,10 +16,11 @@ func TestSSEChatTextAndCollectCompletion(t *testing.T) {
 	stream := strings.Join([]string{
 		`event: trustedrouter.route`,
 		`data: {"id":"r","object":"chat.completion.chunk","created":1,"model":"trustedrouter/synth","choices":[],"trustedrouter":{"synth":{"event":"synth.started","preset":"quality"}}}`,
-		`data: not-json`,
+		`: ignored comment`,
 		``,
 		`event: invisible`,
 		`data: {"id":"r","object":"chat.completion.chunk","created":2,"model":"model/a","choices":[{"index":0,"delta":{"role":"assistant","content":"he"}}]}`,
+		``,
 		`data: {"id":"r","object":"chat.completion.chunk","created":2,"model":"model/a","choices":[{"index":0,"delta":{"content":"l"}}]}`,
 		``,
 		`data: {"id":"r","object":"chat.completion.chunk","created":3,"model":"model/a","choices":[{"index":0,"delta":{"content":"lo ","tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"lookup","arguments":""}}]}}]}`,
@@ -103,7 +104,7 @@ func TestChatCompletionsIncludesUsageOption(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&seen); err != nil {
 			t.Fatal(err)
 		}
-		return textResponse(200, `data: {"id":"x","choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}`+"\n\n", nil), nil
+		return textResponse(200, `data: {"id":"x","choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}`+"\n\ndata: [DONE]\n\n", nil), nil
 	})})
 	if err != nil {
 		t.Fatal(err)
@@ -194,7 +195,7 @@ func TestChatExtraWinsAndPrimitiveModelsDoNotSendEmptyTools(t *testing.T) {
 func TestChatStreamMidReadErrorIsWrapped(t *testing.T) {
 	readErr := errors.New("socket closed")
 	body := &scriptedReadCloser{
-		chunks: []string{`data: {"id":"x","choices":[{"delta":{"content":"ok"}}]}` + "\n"},
+		chunks: []string{`data: {"id":"x","choices":[{"delta":{"content":"ok"}}]}` + "\n\n"},
 		err:    readErr,
 	}
 	sdk, err := NewClient(Options{HTTPClient: newRoundTripClient(func(*http.Request) (*http.Response, error) {
@@ -338,6 +339,7 @@ func TestChatStreamIdleTimeoutResetsBetweenChunks(t *testing.T) {
 						`data: {"id":"x","choices":[{"delta":{"content":"c"}}]}` + "\n\n",
 						`data: {"id":"x","choices":[{"delta":{"content":"d"}}]}` + "\n\n",
 						`data: {"id":"x","choices":[{"delta":{"content":"e"}}]}` + "\n\n",
+						"data: [DONE]\n\n",
 					},
 					delays: []time.Duration{
 						0,
@@ -417,7 +419,7 @@ func TestChatExtraReservedKeysRouteAndUnknownKeysSurvive(t *testing.T) {
 			if err := json.NewDecoder(r.Body).Decode(&seenBody); err != nil {
 				t.Fatal(err)
 			}
-			return textResponse(200, `data: {"id":"x","choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}`+"\n\n", nil), nil
+			return textResponse(200, `data: {"id":"x","choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}`+"\n\ndata: [DONE]\n\n", nil), nil
 		}),
 	})
 	if err != nil {
@@ -440,7 +442,7 @@ func TestChatExtraReservedKeysRouteAndUnknownKeysSurvive(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if got := seenHeader.Get("authorization"); got != "Bearer header" {
+	if got := seenHeader.Get("authorization"); got != "" {
 		t.Fatalf("authorization = %q", got)
 	}
 	if got := seenHeader.Get("x-trustedrouter-workspace"); got != "extra-workspace" {
@@ -496,7 +498,7 @@ func TestFusionToolAdvisorToolAndFusionTools(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&seenBody); err != nil {
 			t.Fatal(err)
 		}
-		return textResponse(200, `data: {"id":"x","choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}`+"\n\n", nil), nil
+		return textResponse(200, `data: {"id":"x","choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}`+"\n\ndata: [DONE]\n\n", nil), nil
 	})})
 	if err != nil {
 		t.Fatal(err)
@@ -550,7 +552,7 @@ func TestFusionDefaultTimeoutOverridesClientDefault(t *testing.T) {
 		HTTPClient: newRoundTripClient(func(r *http.Request) (*http.Response, error) {
 			select {
 			case <-time.After(30 * time.Millisecond):
-				return textResponse(200, `data: {"id":"x","choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}`+"\n\n", nil), nil
+				return textResponse(200, `data: {"id":"x","choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}`+"\n\ndata: [DONE]\n\n", nil), nil
 			case <-r.Context().Done():
 				return nil, r.Context().Err()
 			}

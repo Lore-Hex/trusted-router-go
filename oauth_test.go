@@ -192,17 +192,38 @@ func TestExchangeOAuthKeyPostsWithoutAuthorization(t *testing.T) {
 		method        string
 		path          string
 		authorization string
+		cookie        string
 		workspace     string
+		idempotency   string
+		proxyAuth     string
+		xAPIKey       string
+		telemetry     string
+		publicDefault string
 		body          map[string]any
 	}
 	client := newIncrement3TestClient(t, Options{
 		APIKey:      "client-key",
 		WorkspaceID: "client-workspace",
+		Headers: map[string]string{
+			"Authorization":         "Bearer header-secret",
+			"Proxy-Authorization":   "Basic proxy-secret",
+			"Cookie":                "session=secret",
+			"X-Api-Key":             "alternate-secret",
+			"Idempotency-Key":       "stale-key",
+			"X-Tr-Client":           "stale-telemetry",
+			"X-Conformance-Default": "public-client",
+		},
 	}, func(w http.ResponseWriter, r *http.Request) {
 		seen.method = r.Method
 		seen.path = r.URL.Path
 		seen.authorization = r.Header.Get("authorization")
+		seen.cookie = r.Header.Get("cookie")
 		seen.workspace = r.Header.Get("x-trustedrouter-workspace")
+		seen.idempotency = r.Header.Get("idempotency-key")
+		seen.proxyAuth = r.Header.Get("proxy-authorization")
+		seen.xAPIKey = r.Header.Get("x-api-key")
+		seen.telemetry = r.Header.Get("x-tr-client")
+		seen.publicDefault = r.Header.Get("x-conformance-default")
 		seen.body = decodeRequestBody(t, r)
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"key":      "sk-tr-v1-delegated",
@@ -231,12 +252,18 @@ func TestExchangeOAuthKeyPostsWithoutAuthorization(t *testing.T) {
 		method        string
 		path          string
 		authorization string
+		cookie        string
 		workspace     string
+		idempotency   string
+		proxyAuth     string
+		xAPIKey       string
+		telemetry     string
+		publicDefault string
 		body          map[string]any
 	}{
-		method:    http.MethodPost,
-		path:      "/auth/keys",
-		workspace: "client-workspace",
+		method:        http.MethodPost,
+		path:          "/auth/keys",
+		publicDefault: "public-client",
 		body: map[string]any{
 			"code":                  "auth-code",
 			"code_verifier":         "verifier",

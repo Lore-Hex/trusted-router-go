@@ -284,7 +284,7 @@ func (c *Client) Attestation(ctx context.Context) ([]byte, error) {
 		}
 		return nil, err
 	}
-	if resp.StatusCode >= 400 {
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		payload, ok := parseJSONPayload(body)
 		if !ok {
 			return nil, classifyError(resp.StatusCode, truncateString(string(body), 240), nil, resp.Header)
@@ -394,7 +394,7 @@ func fetchJWKS(ctx context.Context, jwksURL string, httpClient *http.Client) (ma
 		return nil, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return nil, attestationErr(fmt.Sprintf("JWKS fetch returned HTTP %d", resp.StatusCode), nil)
 	}
 	var out map[string]any

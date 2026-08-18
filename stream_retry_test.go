@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-const streamOKBody = `data: {"choices":[{"delta":{"content":"OK"},"finish_reason":"stop"}]}` + "\n\n"
+const streamOKBody = `data: {"choices":[{"delta":{"content":"OK"},"finish_reason":"stop"}]}` + "\n\ndata: [DONE]\n\n"
 
 func collectStreamText(t *testing.T, sdk *Client) (string, error) {
 	t.Helper()
