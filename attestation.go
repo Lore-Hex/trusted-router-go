@@ -201,7 +201,10 @@ type PolicyFromTrustReleaseOptions struct {
 	CertSHA256 string
 	// TrustReleaseURL is fetched when Release is nil. Empty uses DefaultTrustReleaseURL.
 	TrustReleaseURL string
-	// HTTPClient is the HTTP client used when Release is nil.
+	// HTTPClient is the HTTP client used when Release is nil. The SDK shallow-clones
+	// a supplied client, disables redirects, and removes its Cookie Jar for this
+	// credential-free metadata request. A custom RoundTripper remains caller-owned
+	// and can still mutate the request after the SDK's final header scrub.
 	HTTPClient *http.Client
 }
 
@@ -265,7 +268,10 @@ type VerifyGatewayAttestationOptions struct {
 	JWKS map[string]any
 	// JWKSURL is fetched when JWKS is nil. Empty uses GCPJWKSURI.
 	JWKSURL string
-	// HTTPClient is the HTTP client used when JWKS is nil.
+	// HTTPClient is the HTTP client used when JWKS is nil. The SDK shallow-clones
+	// a supplied client, disables redirects, and removes its Cookie Jar for this
+	// credential-free metadata request. A custom RoundTripper remains caller-owned
+	// and can still mutate the request after the SDK's final header scrub.
 	HTTPClient *http.Client
 }
 
@@ -311,7 +317,9 @@ func (c *Client) TrustRelease(ctx context.Context, trustURL string) (*TrustRelea
 	return &out, nil
 }
 
-// FetchTrustRelease fetches and parses the public trust release.
+// FetchTrustRelease fetches and parses the public trust release with an
+// SDK-owned client that has no Cookie Jar and never follows redirects. It does
+// not use or inherit mutable state from http.DefaultClient.
 func FetchTrustRelease(ctx context.Context, trustURL string) (*TrustRelease, error) {
 	return fetchTrustRelease(ctx, trustURL, nil, true)
 }
@@ -353,10 +361,12 @@ func fetchTrustRelease(ctx context.Context, trustURL string, httpClient *http.Cl
 		return nil, err
 	}
 	req.Header.Set("user-agent", userAgent())
-	if httpClient == nil {
-		httpClient = http.DefaultClient
-	}
-	resp, err := httpClient.Do(req)
+	// Keep this as the final SDK operation before handing the request to the
+	// transport. A caller-supplied RoundTripper can mutate requests after this
+	// boundary; callers that inject one are responsible for its behavior.
+	stripCredentialHeaders(req.Header)
+	metadataClient := cloneCredentialFreeHTTPClient(httpClient)
+	resp, err := metadataClient.Do(req)
 	if err != nil {
 		if ctxErr := requestCtx.Err(); ctxErr != nil {
 			return nil, ctxErr
@@ -383,10 +393,12 @@ func fetchJWKS(ctx context.Context, jwksURL string, httpClient *http.Client) (ma
 		return nil, attestationErr("Invalid JWKS URL", err)
 	}
 	req.Header.Set("user-agent", userAgent())
-	if httpClient == nil {
-		httpClient = http.DefaultClient
-	}
-	resp, err := httpClient.Do(req)
+	// Keep this as the final SDK operation before handing the request to the
+	// transport. A caller-supplied RoundTripper can mutate requests after this
+	// boundary; callers that inject one are responsible for its behavior.
+	stripCredentialHeaders(req.Header)
+	metadataClient := cloneCredentialFreeHTTPClient(httpClient)
+	resp, err := metadataClient.Do(req)
 	if err != nil {
 		if ctxErr := requestCtx.Err(); ctxErr != nil {
 			return nil, ctxErr

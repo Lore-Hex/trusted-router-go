@@ -29,7 +29,10 @@ type VerifyGatewaySessionOptions struct {
 	JWKS map[string]any
 	// JWKSURL is fetched when JWKS is nil. Empty uses GCPJWKSURI.
 	JWKSURL string
-	// HTTPClient is the HTTP client used for JWKS fetches only.
+	// HTTPClient is the HTTP client used for JWKS fetches only. The SDK
+	// shallow-clones it, disables redirects, and ignores its Cookie Jar. A custom
+	// RoundTripper remains caller-owned and can mutate the request after the SDK's
+	// final credential scrub.
 	HTTPClient *http.Client
 	// ConnectIP dials this IP while keeping SNI and Host pinned to the BaseURL host.
 	ConnectIP string

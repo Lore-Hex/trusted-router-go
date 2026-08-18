@@ -12,8 +12,13 @@ import (
 	"io"
 	"math/big"
 	"net/http"
+	"net/http/cookiejar"
+	"net/http/httptest"
+	"net/url"
 	"reflect"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -350,6 +355,18 @@ func TestVerifyGatewayAttestationShapeRejections(t *testing.T) {
 }
 
 func TestFetchTrustReleaseAndPolicyFromTrustRelease(t *testing.T) {
+	const releaseJSON = `{
+		"platform": "gcp-confidential-space",
+		"image_digest": "sha256:release",
+		"accepted_image_digests": ["sha256:previous", "sha256:release"],
+		"image_reference": "us-docker.pkg.dev/project/gateway:prod",
+		"accepted_image_references": ["us-docker.pkg.dev/project/gateway:old", "us-docker.pkg.dev/project/gateway:prod"],
+		"attestation_issuer": "https://confidentialcomputing.googleapis.com",
+		"attestation_audience": "quill-cloud",
+		"tls": {"mode": "managed", "hostname": "api.trustedrouter.com"},
+		"data_policy": {"prompt_output_storage": false, "control_plane_prompt_access": false},
+		"extra_field": "kept"
+	}`
 	transport := attestationRoundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if r.Header.Get("user-agent") == "" {
 			t.Error("missing user-agent")
@@ -357,24 +374,17 @@ func TestFetchTrustReleaseAndPolicyFromTrustRelease(t *testing.T) {
 		if r.URL.String() != "https://trust.example/release.json" {
 			t.Fatalf("request URL = %s", r.URL.String())
 		}
-		return attestationTestResponse(http.StatusOK, `{
-			"platform": "gcp-confidential-space",
-			"image_digest": "sha256:release",
-			"accepted_image_digests": ["sha256:previous", "sha256:release"],
-			"image_reference": "us-docker.pkg.dev/project/gateway:prod",
-			"accepted_image_references": ["us-docker.pkg.dev/project/gateway:old", "us-docker.pkg.dev/project/gateway:prod"],
-			"attestation_issuer": "https://confidentialcomputing.googleapis.com",
-			"attestation_audience": "quill-cloud",
-			"tls": {"mode": "managed", "hostname": "api.trustedrouter.com"},
-			"data_policy": {"prompt_output_storage": false, "control_plane_prompt_access": false},
-			"extra_field": "kept"
-		}`), nil
+		return attestationTestResponse(http.StatusOK, releaseJSON), nil
 	})
-	oldDefaultClient := http.DefaultClient
-	http.DefaultClient = &http.Client{Transport: transport}
-	defer func() { http.DefaultClient = oldDefaultClient }()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("user-agent") == "" {
+			t.Error("missing user-agent")
+		}
+		_, _ = io.WriteString(w, releaseJSON)
+	}))
+	defer server.Close()
 
-	release, err := FetchTrustRelease(context.Background(), "https://trust.example/release.json")
+	release, err := FetchTrustRelease(context.Background(), server.URL+"/release.json")
 	if err != nil {
 		t.Fatalf("FetchTrustRelease returned error: %v", err)
 	}
@@ -420,6 +430,170 @@ func TestFetchTrustReleaseAndPolicyFromTrustRelease(t *testing.T) {
 	}
 	if fetchedPolicy.GCPAudience != defaultAttestationAudience || fetchedPolicy.ExpectedImageDigest != "sha256:release" {
 		t.Fatalf("fetched policy = %#v", fetchedPolicy)
+	}
+}
+
+func TestMetadataFetchesIgnoreDefaultClientAndSuppliedCookieJars(t *testing.T) {
+	const releaseJSON = `{"image_digest":"sha256:release","image_reference":"image:prod"}`
+	fixture := newAttestationFixture(t)
+	token := fixture.mint(t, fixture.claims(nil))
+	jwksJSON, err := json.Marshal(fixture.jwks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seenCookies := make(map[string][]string)
+	var seenCookiesMu sync.Mutex
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenCookiesMu.Lock()
+		seenCookies[r.URL.Path] = append(seenCookies[r.URL.Path], r.Header.Get("cookie"))
+		seenCookiesMu.Unlock()
+		switch r.URL.Path {
+		case "/release-default", "/release-supplied":
+			_, _ = io.WriteString(w, releaseJSON)
+		case "/jwks-default", "/jwks-supplied":
+			_, _ = w.Write(jwksJSON)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	serverURL, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jar.SetCookies(serverURL, []*http.Cookie{{Name: "ambient", Value: "secret"}})
+
+	oldDefaultClient := http.DefaultClient
+	http.DefaultClient = &http.Client{
+		Jar: jar,
+		Transport: attestationRoundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, errors.New("mutable http.DefaultClient must not be used")
+		}),
+	}
+	defer func() { http.DefaultClient = oldDefaultClient }()
+
+	if _, err := FetchTrustRelease(context.Background(), server.URL+"/release-default"); err != nil {
+		t.Fatalf("FetchTrustRelease used http.DefaultClient: %v", err)
+	}
+	verifyWithJWKS := func(jwksURL string, client *http.Client) error {
+		_, err := VerifyGatewayAttestation(context.Background(), token, VerifyGatewayAttestationOptions{
+			Policy:     fixture.policy,
+			NonceHex:   fixture.nonce,
+			TLSCertDER: fixture.certDER,
+			JWKSURL:    jwksURL,
+			HTTPClient: client,
+		})
+		return err
+	}
+	if err := verifyWithJWKS(server.URL+"/jwks-default", nil); err != nil {
+		t.Fatalf("VerifyGatewayAttestation used http.DefaultClient: %v", err)
+	}
+
+	supplied := &http.Client{Jar: jar}
+	if _, err := PolicyFromTrustRelease(context.Background(), PolicyFromTrustReleaseOptions{
+		TrustReleaseURL: server.URL + "/release-supplied",
+		HTTPClient:      supplied,
+	}); err != nil {
+		t.Fatalf("PolicyFromTrustRelease returned error: %v", err)
+	}
+	if err := verifyWithJWKS(server.URL+"/jwks-supplied", supplied); err != nil {
+		t.Fatalf("VerifyGatewayAttestation with supplied client returned error: %v", err)
+	}
+
+	seenCookiesMu.Lock()
+	defer seenCookiesMu.Unlock()
+	for path, cookies := range seenCookies {
+		for _, cookie := range cookies {
+			if cookie != "" {
+				t.Errorf("metadata request %s carried Cookie %q", path, cookie)
+			}
+		}
+	}
+	if got := jar.Cookies(serverURL); len(got) != 1 || got[0].Name != "ambient" {
+		t.Fatalf("caller cookie Jar was mutated: %#v", got)
+	}
+}
+
+func TestMetadataFetchesRejectCrossOriginRedirects(t *testing.T) {
+	fixture := newAttestationFixture(t)
+	token := fixture.mint(t, fixture.claims(nil))
+	jwksJSON, err := json.Marshal(fixture.jwks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var targetCalls atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetCalls.Add(1)
+		_, _ = w.Write(jwksJSON)
+	}))
+	defer target.Close()
+
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+r.URL.Path, http.StatusTemporaryRedirect)
+	}))
+	defer source.Close()
+
+	tests := []struct {
+		name string
+		run  func() error
+	}{
+		{
+			name: "trust release owned client",
+			run: func() error {
+				_, err := FetchTrustRelease(context.Background(), source.URL+"/release-owned")
+				return err
+			},
+		},
+		{
+			name: "trust release supplied client",
+			run: func() error {
+				_, err := PolicyFromTrustRelease(context.Background(), PolicyFromTrustReleaseOptions{
+					TrustReleaseURL: source.URL + "/release-supplied",
+					HTTPClient:      &http.Client{},
+				})
+				return err
+			},
+		},
+		{
+			name: "JWKS owned client",
+			run: func() error {
+				_, err := VerifyGatewayAttestation(context.Background(), token, VerifyGatewayAttestationOptions{
+					Policy:     fixture.policy,
+					NonceHex:   fixture.nonce,
+					TLSCertDER: fixture.certDER,
+					JWKSURL:    source.URL + "/jwks-owned",
+				})
+				return err
+			},
+		},
+		{
+			name: "JWKS supplied client",
+			run: func() error {
+				_, err := VerifyGatewayAttestation(context.Background(), token, VerifyGatewayAttestationOptions{
+					Policy:     fixture.policy,
+					NonceHex:   fixture.nonce,
+					TLSCertDER: fixture.certDER,
+					JWKSURL:    source.URL + "/jwks-supplied",
+					HTTPClient: &http.Client{},
+				})
+				return err
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if err := test.run(); err == nil {
+				t.Fatal("redirect response was accepted")
+			}
+		})
+	}
+	if calls := targetCalls.Load(); calls != 0 {
+		t.Fatalf("cross-origin redirect target received %d metadata requests", calls)
 	}
 }
 

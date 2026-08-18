@@ -60,7 +60,12 @@ Control-plane methods use `DefaultControlBaseURL`: `Models`, `Providers`,
 `StablecoinCheckout`, `AuthSession`, `Logout`, `UserInfo`, `Activity`,
 `OAuthAuthorizeURL`, `CreateOAuthAuthorization`, and `ExchangeOAuthKey`.
 `Status`, `TrustRelease`, and `FetchTrustRelease` fetch their configured
-absolute metadata URLs rather than either `/v1` plane.
+absolute metadata URLs rather than either `/v1` plane. Package-level trust
+release and JWKS retrieval never use mutable `http.DefaultClient`; owned
+transports have no cookie jar and do not redirect. A supplied `http.Client` is
+shallow-cloned with its jar removed and redirects disabled. Its custom
+`RoundTripper`, if any, remains an explicit caller-owned boundary because it can
+mutate a request after the SDK's final header scrub.
 
 ## JS `index.d.ts`
 

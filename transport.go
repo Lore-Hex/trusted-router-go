@@ -441,7 +441,10 @@ func cloneHTTPClientWithRedirectProtection(client *http.Client) *http.Client {
 }
 
 func cloneCredentialFreeHTTPClient(client *http.Client) *http.Client {
-	credentialFree := *client
+	// Start from the same redirect-protected shallow clone used by API traffic.
+	// With nil input this creates a fresh private client rather than inheriting
+	// mutable process-global state from http.DefaultClient.
+	credentialFree := *cloneHTTPClientWithRedirectProtection(client)
 	// A standard-library cookie Jar mutates outgoing requests inside Client.Do,
 	// after SDK header assembly. Removing it on this private clone keeps public
 	// metadata and OAuth exchange credential-free without changing the caller's
