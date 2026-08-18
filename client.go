@@ -23,9 +23,12 @@ type Options struct {
 	// ControlBaseURL is a custom TrustedRouter control-plane base URL.
 	ControlBaseURL string
 	// HTTPClient is the HTTP client used for network requests.
-	// When HTTPClient is provided, it is used verbatim; SDK timeouts are still
-	// applied with request contexts and any timeout on the supplied client remains
-	// the caller's responsibility.
+	// When HTTPClient is provided, the SDK shallow-clones it and overrides only
+	// CheckRedirect so API requests cannot carry credentials or bodies to a
+	// redirect target. Transport, Jar, Timeout, and other settings are preserved,
+	// and the caller's client is not mutated. SDK timeouts are still applied with
+	// request contexts; any timeout on the supplied client remains the caller's
+	// responsibility.
 	HTTPClient *http.Client
 	// Timeout configures the default per-attempt request timeout. Nil uses
 	// DefaultRequestTimeout. A pointer to 0 disables SDK timeouts by default.
@@ -74,17 +77,18 @@ type CallOptions struct {
 
 // Client is a TrustedRouter API client.
 type Client struct {
-	apiKey           string
-	baseURL          string
-	controlBaseURL   string
-	httpClient       *http.Client
-	timeout          *time.Duration
-	headers          map[string]string
-	workspaceID      string
-	maxRetries       int
-	regionalFailover bool
-	telemetry        bool
-	baseURLs         []string
+	apiKey                   string
+	baseURL                  string
+	controlBaseURL           string
+	httpClient               *http.Client
+	credentialFreeHTTPClient *http.Client
+	timeout                  *time.Duration
+	headers                  map[string]string
+	workspaceID              string
+	maxRetries               int
+	regionalFailover         bool
+	telemetry                bool
+	baseURLs                 []string
 }
 
 // NewClient constructs a TrustedRouter client.
@@ -114,10 +118,8 @@ func NewClient(opts Options) (*Client, error) {
 		failoverEnabled = *opts.RegionalFailover
 	}
 
-	httpClient := opts.HTTPClient
-	if httpClient == nil {
-		httpClient = &http.Client{}
-	}
+	httpClient := cloneHTTPClientWithRedirectProtection(opts.HTTPClient)
+	credentialFreeHTTPClient := cloneCredentialFreeHTTPClient(httpClient)
 	defaultTimeout := defaultTimeoutFromOptions(opts.Timeout)
 
 	headers := map[string]string{}
@@ -126,17 +128,18 @@ func NewClient(opts Options) (*Client, error) {
 	}
 
 	return &Client{
-		apiKey:           opts.APIKey,
-		baseURL:          baseURL,
-		controlBaseURL:   controlBaseURL,
-		httpClient:       httpClient,
-		timeout:          defaultTimeout,
-		headers:          headers,
-		workspaceID:      opts.WorkspaceID,
-		maxRetries:       maxRetries,
-		regionalFailover: failoverEnabled,
-		telemetry:        resolveTelemetryEnabled(opts.Telemetry, baseURL, controlBaseURL, os.Getenv),
-		baseURLs:         inferenceBaseURLs(baseURL),
+		apiKey:                   opts.APIKey,
+		baseURL:                  baseURL,
+		controlBaseURL:           controlBaseURL,
+		httpClient:               httpClient,
+		credentialFreeHTTPClient: credentialFreeHTTPClient,
+		timeout:                  defaultTimeout,
+		headers:                  headers,
+		workspaceID:              opts.WorkspaceID,
+		maxRetries:               maxRetries,
+		regionalFailover:         failoverEnabled,
+		telemetry:                resolveTelemetryEnabled(opts.Telemetry, baseURL, controlBaseURL, os.Getenv),
+		baseURLs:                 inferenceBaseURLs(baseURL),
 	}, nil
 }
 

@@ -235,6 +235,13 @@ if err != nil {
 fmt.Println(att.AsMap())
 ```
 
+Standalone trust-release and JWKS retrieval is credential-free: the SDK uses a
+fresh private client when none is supplied, never consults `http.DefaultClient`,
+does not follow redirects, and ignores a supplied client's cookie jar. Supplied
+clients are shallow-cloned and are not mutated. A custom `RoundTripper` is an
+explicit caller-owned trust boundary: it runs after the SDK's final credential
+header scrub and can still alter the outgoing request.
+
 The `trustedrouter attest --verify` CLI command performs the TLS certificate
 fetch and full verification flow.
 

@@ -175,7 +175,7 @@ func (e Embedding) MarshalJSON() ([]byte, error) {
 // Embeddings sends an OpenAI-compatible embeddings request.
 func (c *Client) Embeddings(ctx context.Context, req EmbeddingsRequest) (*EmbeddingsResponse, error) {
 	var out EmbeddingsResponse
-	callOpts := req.CallOptions
+	callOpts := ensureIdempotencyKey(req.CallOptions)
 	if err := c.Request(ctx, http.MethodPost, "/embeddings", buildEmbeddingsBody(req), &out, &callOpts); err != nil {
 		return nil, err
 	}

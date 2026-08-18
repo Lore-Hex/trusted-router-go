@@ -175,7 +175,8 @@ func (c *Client) AuthSession(ctx context.Context) (*AuthSessionResponse, error) 
 // Logout logs out the current auth session.
 func (c *Client) Logout(ctx context.Context) (*LogoutResponse, error) {
 	var out LogoutResponse
-	if err := c.controlRequest(ctx, http.MethodPost, "/auth/logout", nil, &out, nil); err != nil {
+	callOpts := ensureIdempotencyKey(CallOptions{})
+	if err := c.controlRequest(ctx, http.MethodPost, "/auth/logout", nil, &out, &callOpts); err != nil {
 		return nil, err
 	}
 	return &out, nil

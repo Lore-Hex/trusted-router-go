@@ -120,9 +120,7 @@ func (r ResponseInputTokens) MarshalJSON() ([]byte, error) {
 func (c *Client) Responses(ctx context.Context, req ResponsesRequest) (*ResponseObject, error) {
 	var out ResponseObject
 	callOpts := responsesCallOptions(req, true)
-	if callOpts.IdempotencyKey == "" {
-		callOpts.IdempotencyKey = newIdempotencyKey()
-	}
+	callOpts = ensureIdempotencyKey(callOpts)
 	if err := c.Request(ctx, http.MethodPost, "/responses", buildResponsesBody(req, false), &out, &callOpts); err != nil {
 		return nil, err
 	}
@@ -169,6 +167,7 @@ func (c *Client) ResponsesRawStream(ctx context.Context, req ResponsesRequest) (
 func (c *Client) ResponsesInputTokens(ctx context.Context, req ResponsesRequest) (*ResponseInputTokens, error) {
 	var out ResponseInputTokens
 	callOpts := responsesCallOptions(req, false)
+	callOpts = ensureIdempotencyKey(callOpts)
 	if err := c.Request(ctx, http.MethodPost, "/responses/input_tokens", buildResponsesBody(req, false), &out, &callOpts); err != nil {
 		return nil, err
 	}
