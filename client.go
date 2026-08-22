@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -46,15 +47,29 @@ type Options struct {
 	// The apex is a global load balancer; failover is handled server-side, so the
 	// SDK re-requests the apex rather than pinning per-region hosts.
 	RegionalFailover *bool
-	// Telemetry enables or disables the client-observed reliability telemetry
-	// header (`x-tr-client`, contract v1). The header is content-free — closed
-	// enums and bounded integers only — and is never sent to custom base URLs
-	// or on control-plane calls. Nil resolves from the environment:
+	// Telemetry enables or disables client-observed reliability telemetry
+	// (contract v1): the per-attempt `x-tr-client` request header and the
+	// beacon — a bounded, content-free batch of reliability events and exact
+	// per-minute counters POSTed to the control plane's /client-events by a
+	// background goroutine outside the retry engine. Everything on the wire
+	// is a closed enum or a bounded integer: no prompt text, no hostnames,
+	// no ids beyond SDK-minted batch ids. Nothing is recorded for custom
+	// base URLs or control-plane calls. Nil resolves from the environment:
 	// TRUSTEDROUTER_TELEMETRY ({0,false,off,no} disables, {1,true,on,yes}
 	// enables), then DO_NOT_TRACK=1 disables, then default on only when both
 	// the inference base and the control base are TrustedRouter hosts.
-	// Opting out does not change the User-Agent.
+	// Opting out disables the header AND the beacon (no goroutine is ever
+	// started) and does not change the User-Agent. Set
+	// TRUSTEDROUTER_TELEMETRY_DEBUG=1 to echo each batch to stderr before it
+	// is sent. Call Close to flush buffered telemetry (at most 2 seconds)
+	// when the process is about to exit.
 	Telemetry *bool
+	// TelemetrySampleRate is the fraction of healthy, fast, first-attempt
+	// successes the beacon reports (failures, retried or failed-over calls,
+	// and calls slower than 30 s are always reported). Nil uses the
+	// contract default of 0.01; a pointer to 0 reports no sampled
+	// successes. The control plane may lower it, never raise it.
+	TelemetrySampleRate *float64
 }
 
 // CallOptions configures a single TrustedRouter API call.
@@ -88,7 +103,14 @@ type Client struct {
 	maxRetries               int
 	regionalFailover         bool
 	telemetry                bool
+	telemetrySampleRate      float64
 	baseURLs                 []string
+
+	// telemetryMu guards the lazily created beacon reporter. telemetrySink
+	// is the reporter in production; tests inject a recording sink.
+	telemetryMu       sync.Mutex
+	telemetrySink     telemetrySink
+	telemetryReporter *telemetryReporter
 }
 
 // NewClient constructs a TrustedRouter client.
@@ -127,6 +149,11 @@ func NewClient(opts Options) (*Client, error) {
 		headers[key] = value
 	}
 
+	telemetrySampleRate := telemetryDefaultSampleRate
+	if opts.TelemetrySampleRate != nil {
+		telemetrySampleRate = telemetrySampleRateValue(*opts.TelemetrySampleRate)
+	}
+
 	return &Client{
 		apiKey:                   opts.APIKey,
 		baseURL:                  baseURL,
@@ -139,8 +166,44 @@ func NewClient(opts Options) (*Client, error) {
 		maxRetries:               maxRetries,
 		regionalFailover:         failoverEnabled,
 		telemetry:                resolveTelemetryEnabled(opts.Telemetry, baseURL, controlBaseURL, os.Getenv),
+		telemetrySampleRate:      telemetrySampleRate,
 		baseURLs:                 inferenceBaseURLs(baseURL),
 	}, nil
+}
+
+// Close flushes buffered client telemetry to the control plane — one
+// attempt, at most 2 seconds — and stops the beacon's background goroutine.
+// It never fails; the error return satisfies io.Closer. The client remains
+// usable afterwards, but records no further telemetry. Clients with
+// telemetry disabled have nothing to flush and return immediately.
+func (c *Client) Close() error {
+	c.telemetryMu.Lock()
+	reporter := c.telemetryReporter
+	c.telemetryMu.Unlock()
+	if reporter != nil {
+		reporter.close(telemetryCloseTimeout)
+	}
+	return nil
+}
+
+// telemetrySinkFor returns the beacon sink, creating the reporter on the
+// first recorded inference call (contract §6.2: lazily, never at
+// construction). Its worker goroutine starts on the first record.
+func (c *Client) telemetrySinkFor() telemetrySink {
+	c.telemetryMu.Lock()
+	defer c.telemetryMu.Unlock()
+	if c.telemetrySink == nil {
+		c.telemetryReporter = newTelemetryReporter(c.controlBaseURL, c.apiKey, c.workspaceID, telemetrySDKIdentity(), c.telemetrySampleRate)
+		c.telemetrySink = c.telemetryReporter
+	}
+	return c.telemetrySink
+}
+
+// newRequestRecorder builds the recorder for one inference-plane call
+// (transport.go do() is the one emit point).
+func (c *Client) newRequestRecorder(spec requestSpec) *requestRecorder {
+	timeout, hasTimeout := c.effectiveTimeout(spec.opts)
+	return newRequestRecorder(c.telemetrySinkFor(), spec.telemetry, spec.streamOpen, timeout, hasTimeout)
 }
 
 // APIKey returns the configured default API key.

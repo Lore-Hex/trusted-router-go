@@ -122,6 +122,7 @@ func cmdChat(ctx context.Context, globals globalOptions, argv []string) int {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 2
 	}
+	defer client.Close()
 	req := trustedrouter.ChatRequest{
 		Model:    model,
 		Messages: []map[string]any{{"role": "user", "content": prompt}},
@@ -155,6 +156,7 @@ func cmdList(ctx context.Context, globals globalOptions, name string) int {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 2
 	}
+	defer client.Close()
 	switch name {
 	case "models":
 		value, err := client.Models(ctx, nil)
@@ -205,6 +207,7 @@ func cmdAttest(ctx context.Context, globals globalOptions, argv []string) int {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 2
 	}
+	defer client.Close()
 	if sessionMode {
 		return cmdAttestSession(ctx, client.BaseURL(), connectIP)
 	}

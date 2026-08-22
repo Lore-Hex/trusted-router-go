@@ -1092,16 +1092,20 @@ func TestTelemetryHeaderBoundsAndGrammar(t *testing.T) {
 	})
 }
 
-// TestRequestRecorderRetainsOnlyTheLastAttempt is the memory-bound regression
-// for Options.MaxRetries, which is intentionally uncapped. The header for an
-// attempt reads only its immediate predecessor, so even a pathological retry
-// count must leave exactly one attempt record reachable from the recorder.
-func TestRequestRecorderRetainsOnlyTheLastAttempt(t *testing.T) {
+// TestRequestRecorderHistoryStaysBounded is the memory-bound regression for
+// Options.MaxRetries, which is intentionally uncapped. The header for an
+// attempt reads only its immediate predecessor, and the beacon event may
+// carry at most 16 attempts (§5.3), so even a pathological retry count must
+// leave exactly one scalar record plus a 16-entry history reachable from the
+// recorder — while the exact counters (§5.4) still count every attempt
+// through the folded overflow.
+func TestRequestRecorderHistoryStaysBounded(t *testing.T) {
 	const attemptCount = 10_000
-	recorder := newRequestRecorder(false)
+	sink := &recordingTelemetrySink{}
+	recorder := newRequestRecorder(sink, telemetryRequestFacts{endpoint: "models", method: http.MethodGet}, false, 0, false)
 	for i := 0; i < attemptCount; i++ {
 		recorder.beginAttempt(DefaultAPIBaseURL)
-		recorder.onResponse(http.StatusServiceUnavailable)
+		recorder.onResponse(http.StatusServiceUnavailable, nil)
 	}
 	if recorder.nextIndex != attemptCount {
 		t.Fatalf("nextIndex = %d, want %d", recorder.nextIndex, attemptCount)
@@ -1109,8 +1113,14 @@ func TestRequestRecorderRetainsOnlyTheLastAttempt(t *testing.T) {
 	if !recorder.hasLastAttempt || recorder.lastAttempt.index != attemptCount-1 {
 		t.Fatalf("retained attempt = (%t, %d), want (true, %d)", recorder.hasLastAttempt, recorder.lastAttempt.index, attemptCount-1)
 	}
+	if len(recorder.attempts) != telemetryMaxEventAttempts {
+		t.Fatalf("event history holds %d attempts, want the §5.3 cap of %d", len(recorder.attempts), telemetryMaxEventAttempts)
+	}
+	if len(recorder.overflow) != 1 {
+		t.Fatalf("overflow holds %d keys, want 1 (every attempt shares one counter key)", len(recorder.overflow))
+	}
 
-	recorderType := reflect.TypeOf(*recorder)
+	recorderType := reflect.TypeOf(recorder).Elem()
 	attemptType := reflect.TypeOf(telemetryAttempt{})
 	attemptFields := 0
 	for i := 0; i < recorderType.NumField(); i++ {
@@ -1118,12 +1128,35 @@ func TestRequestRecorderRetainsOnlyTheLastAttempt(t *testing.T) {
 		if field.Type == attemptType {
 			attemptFields++
 		}
-		if field.Type == reflect.SliceOf(attemptType) {
-			t.Fatalf("requestRecorder.%s retains an attempt history; recorder state must stay O(1)", field.Name)
+		if field.Type == reflect.SliceOf(attemptType) && field.Name != "attempts" {
+			t.Fatalf("requestRecorder.%s retains a second attempt history; recorder state must stay bounded", field.Name)
 		}
 	}
 	if attemptFields != 1 {
 		t.Fatalf("requestRecorder retains %d scalar attempt records, want exactly 1", attemptFields)
+	}
+
+	// The counters are still exact: the request row counts every attempt,
+	// and the attempt rows sum to the same total.
+	recorder.finish()
+	if len(sink.events) != 1 {
+		t.Fatalf("events = %d, want 1", len(sink.events))
+	}
+	if got := len(sink.events[0].attempts); got != telemetryMaxEventAttempts {
+		t.Fatalf("event carries %d attempts, want %d", got, telemetryMaxEventAttempts)
+	}
+	if got := sink.counters[0][0].attempts; got != attemptCount {
+		t.Fatalf("request row attempts = %d, want %d", got, attemptCount)
+	}
+	attemptRows := 0
+	for _, increment := range sink.counters[0][1:] {
+		if increment.key.level != "attempt" {
+			t.Fatalf("unexpected counter level %q", increment.key.level)
+		}
+		attemptRows += increment.attempts
+	}
+	if attemptRows != attemptCount {
+		t.Fatalf("attempt rows count %d attempts, want %d", attemptRows, attemptCount)
 	}
 }
 
