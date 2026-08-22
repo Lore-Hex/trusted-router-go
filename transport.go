@@ -94,6 +94,10 @@ type requestSpec struct {
 	// controlPlane marks a control-plane call: client telemetry records
 	// nothing and sends no x-tr-client header for those (contract §3.2).
 	controlPlane bool
+	// telemetry carries the bounded request facts (endpoint enum, method,
+	// regex-bounded model, provider pin) the recorder needs; derived by the
+	// plane router before the body is marshaled, never from the bytes.
+	telemetry telemetryRequestFacts
 }
 
 // do is THE transport engine: the only loop that advances a candidate index,
@@ -116,13 +120,16 @@ func (c *Client) do(ctx context.Context, spec requestSpec) (*http.Response, erro
 		}
 	}
 
-	// Client-observed reliability telemetry, header channel (contract v1
-	// §6.1: do() is the ONE emit point). One recorder per logical call;
-	// control-plane calls and opted-out clients record nothing, and the
-	// recorder's methods are nil-safe so the wiring stays unconditional.
+	// Client-observed reliability telemetry (contract v1 §6.1: do() is the
+	// ONE emit point). One recorder per logical call; control-plane calls
+	// and opted-out clients record nothing, and the recorder's methods are
+	// nil-safe so the wiring stays unconditional. The call is not over when
+	// do() returns: a returned response body is wrapped so the recorder
+	// finishes — and reports the §5.3 event and §5.4 counters to the beacon
+	// reporter — only once the caller has drained or closed it.
 	var recorder *requestRecorder
 	if c.telemetry && !spec.controlPlane {
-		recorder = newRequestRecorder(spec.streamOpen)
+		recorder = c.newRequestRecorder(spec)
 	}
 
 	attempt := 0
@@ -133,6 +140,10 @@ func (c *Client) do(ctx context.Context, spec requestSpec) (*http.Response, erro
 	timeout, hasTimeout := c.effectiveTimeout(spec.opts)
 	for {
 		if err := ctx.Err(); err != nil {
+			// The caller's context ended between attempts: a caller abort
+			// of the attempt in flight, if any (§5.3 aborted).
+			recorder.onAborted()
+			recorder.finish()
 			return nil, err
 		}
 
@@ -164,6 +175,7 @@ func (c *Client) do(ctx context.Context, spec requestSpec) (*http.Response, erro
 		if err != nil {
 			stopTimer(openTimer)
 			cancelAttempt()
+			recorder.finish()
 			return nil, err
 		}
 
@@ -177,18 +189,26 @@ func (c *Client) do(ctx context.Context, spec requestSpec) (*http.Response, erro
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				cancelAttempt()
+				recorder.onAborted()
+				recorder.finish()
 				return nil, ctxErr
 			}
 			openTimedOut := spec.streamOpen && errors.Is(context.Cause(attemptCtx), errOpenTimeout)
 			// Classify for telemetry BEFORE the transportRetryError flatten
 			// below and the errOpenTimeout swap: after either, only a
 			// message string remains of the typed error chain (§6.1).
-			recorder.onTransportError(err, openTimedOut)
+			recorder.onTransportError(err, openTimedOut, false, false)
 			if openTimedOut {
 				err = errOpenTimeout
 			}
-			if attempt >= c.maxRetries || !requestReplaySafe(spec.method, spec.opts) {
+			replaySafe := requestReplaySafe(spec.method, spec.opts)
+			if attempt >= c.maxRetries || !replaySafe {
 				cancelAttempt()
+				// Exhausted means the engine gave up on a replayable
+				// failure after retrying (§5.3), mirroring the reference:
+				// a non-replayable call is surfaced, not exhausted.
+				recorder.markExhausted(attempt > 0 && replaySafe)
+				recorder.finish()
 				return nil, transportRetryError(err)
 			}
 			cancelAttempt()
@@ -201,14 +221,17 @@ func (c *Client) do(ctx context.Context, spec requestSpec) (*http.Response, erro
 				recorder.onMoved()
 			}
 			if sleepErr := sleepForRetry(ctx, attempt, nil); sleepErr != nil {
+				recorder.onAborted()
+				recorder.finish()
 				return nil, sleepErr
 			}
 			attempt++
 			continue
 		}
 
-		recorder.onResponse(resp.StatusCode)
-		if attempt >= c.maxRetries || !retryable(resp.StatusCode, resp.Header) || !requestReplaySafe(spec.method, spec.opts) {
+		recorder.onResponse(resp.StatusCode, resp.Header)
+		canRetry := retryable(resp.StatusCode, resp.Header) && requestReplaySafe(spec.method, spec.opts)
+		if attempt >= c.maxRetries || !canRetry {
 			if spec.streamOpen {
 				if hasTimeout {
 					resp.Body = newStreamIdleTimeoutReadCloser(resp.Body, attemptCtx, cancelStream, timeout)
@@ -217,6 +240,14 @@ func (c *Client) do(ctx context.Context, spec requestSpec) (*http.Response, erro
 				}
 			} else if hasTimeout {
 				resp.Body = cancelOnCloseReadCloser{ReadCloser: resp.Body, cancel: cancelBuffered}
+			}
+			if recorder != nil {
+				// The retry budget ran out on a retryable status: exhausted
+				// (§5.3). The response is still returned for the caller to
+				// classify (invariant 9), so the recorder finishes when the
+				// caller is done with the body.
+				recorder.markExhausted(attempt > 0 && canRetry)
+				resp.Body = newTelemetryBody(ctx, resp.Body, recorder)
 			}
 			return resp, nil
 		}
@@ -232,6 +263,8 @@ func (c *Client) do(ctx context.Context, spec requestSpec) (*http.Response, erro
 			recorder.onMoved()
 		}
 		if sleepErr := sleepForRetry(ctx, attempt, retryAfter); sleepErr != nil {
+			recorder.onAborted()
+			recorder.finish()
 			return nil, sleepErr
 		}
 		attempt++
@@ -241,7 +274,10 @@ func (c *Client) do(ctx context.Context, spec requestSpec) (*http.Response, erro
 // absoluteRequest is a documented ONE-SHOT (retries=0) path for credential-
 // free metadata fetches at absolute URLs outside either /v1 plane (Status,
 // Attestation, TrustRelease). It deliberately does not enter do(): there is
-// no candidate list, no retry, and no credential attached.
+// no candidate list, no retry, and no credential attached. It is also the
+// out-of-engine precedent (contract §6.1) that the telemetry beacon sender
+// follows — telemetryReporter.post in telemetry_reporter.go has the same
+// single-shot shape, on the reporter's own client.
 func (c *Client) absoluteRequest(ctx context.Context, method, requestURL string) (*http.Response, error) {
 	timeout, hasTimeout := c.effectiveTimeout(nil)
 	attemptCtx, cancel := contextWithOptionalTimeout(ctx, timeout, hasTimeout)

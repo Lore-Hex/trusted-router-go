@@ -93,6 +93,7 @@ func (c *Client) dispatchRequest(ctx context.Context, method, path string, body 
 		failover:       regionalFailover,
 		controlPlane:   controlPlane,
 		credentialFree: credentialFree,
+		telemetry:      telemetryRequestFactsFor(method, path, body),
 	})
 }
 

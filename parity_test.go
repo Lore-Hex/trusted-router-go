@@ -130,6 +130,7 @@ func TestParityCompileReference(t *testing.T) {
 		(*Client).BaseURL,
 		(*Client).ControlBaseURL,
 		(*Client).BaseURLs,
+		(*Client).Close,
 		(*Client).Request,
 		(*Client).RawRequest,
 		(*Client).ChatCompletions,

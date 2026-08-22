@@ -167,6 +167,7 @@ func (c *Client) openEventStream(ctx context.Context, method, path string, body 
 		failover:        c.regionalFailover,
 		streamOpen:      true,
 		autoIdempotency: true,
+		telemetry:       telemetryRequestFactsFor(method, path, body),
 	})
 	if err != nil {
 		return nil, err

@@ -13,10 +13,50 @@ import (
 
 var errSSEUnexpectedEOF = errors.New("SSE stream ended before a terminal event")
 
+// sseTelemetryObserver is implemented by the telemetry body wrapper the
+// engine returns (telemetry.go telemetryBody). The SSE decoder is the only
+// place time-to-first-token is observable (contract §6.1), and the only
+// place a consumer stopping early — the Go shape of a closed generator — is
+// observable, so both hooks fire from here. A plain reader has no observer
+// and the decoder behaves exactly as before.
+type sseTelemetryObserver interface {
+	onFirstEvent()
+	onAborted()
+}
+
+type sseTelemetryHooks struct {
+	observer sseTelemetryObserver
+	first    bool
+}
+
+func newSSETelemetryHooks(r io.Reader) *sseTelemetryHooks {
+	observer, _ := r.(sseTelemetryObserver)
+	return &sseTelemetryHooks{observer: observer, first: true}
+}
+
+// yielded reports the outcome of handing one event to the consumer: the
+// first event marks ttft, and a consumer that stops iterating is an abort.
+func (h *sseTelemetryHooks) yielded(yield func(map[string]any, error) bool, event map[string]any) bool {
+	if h.first {
+		h.first = false
+		if h.observer != nil {
+			h.observer.onFirstEvent()
+		}
+	}
+	if yield(event, nil) {
+		return true
+	}
+	if h.observer != nil {
+		h.observer.onAborted()
+	}
+	return false
+}
+
 func iterSSEEvents(r io.Reader) iter.Seq2[map[string]any, error] {
 	return func(yield func(map[string]any, error) bool) {
 		// Divergence from trusted-router-py: bare-\r SSE line endings are unsupported.
 		reader := bufio.NewReader(r)
+		hooks := newSSETelemetryHooks(r)
 		var frame []string
 		for {
 			line, err := reader.ReadString('\n')
@@ -29,7 +69,7 @@ func iterSSEEvents(r io.Reader) iter.Seq2[map[string]any, error] {
 						yield(nil, frameErr)
 						return
 					}
-					if event != nil && !yield(event, nil) {
+					if event != nil && !hooks.yielded(yield, event) {
 						return
 					}
 					if terminal {
@@ -49,7 +89,7 @@ func iterSSEEvents(r io.Reader) iter.Seq2[map[string]any, error] {
 					yield(nil, frameErr)
 					return
 				}
-				if event != nil && !yield(event, nil) {
+				if event != nil && !hooks.yielded(yield, event) {
 					return
 				}
 				if !terminal {
@@ -65,6 +105,7 @@ func iterSSEChunks(r io.Reader) iter.Seq2[map[string]any, error] {
 	return func(yield func(map[string]any, error) bool) {
 		// Divergence from trusted-router-py: bare-\r SSE line endings are unsupported.
 		reader := bufio.NewReader(r)
+		hooks := newSSETelemetryHooks(r)
 		var frame []string
 		for {
 			line, err := reader.ReadString('\n')
@@ -77,7 +118,7 @@ func iterSSEChunks(r io.Reader) iter.Seq2[map[string]any, error] {
 						yield(nil, frameErr)
 						return
 					}
-					if chunk != nil && !yield(chunk, nil) {
+					if chunk != nil && !hooks.yielded(yield, chunk) {
 						return
 					}
 					if terminal {
@@ -97,7 +138,7 @@ func iterSSEChunks(r io.Reader) iter.Seq2[map[string]any, error] {
 					yield(nil, frameErr)
 					return
 				}
-				if chunk != nil && !yield(chunk, nil) {
+				if chunk != nil && !hooks.yielded(yield, chunk) {
 					return
 				}
 				if !terminal {

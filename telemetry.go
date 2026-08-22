@@ -1,22 +1,23 @@
 package trustedrouter
 
-// telemetry.go is the HEADER CHANNEL of the client-observed reliability
+// telemetry.go is the RECORDING side of the client-observed reliability
 // telemetry contract, v1 (docs/client-telemetry.md in Lore-Hex/quill-router):
-// the per-attempt `x-tr-client` request header (§3.2), the closed host and
-// error-class vocabulary (§5.2), and the opt-out resolution (§6.3). It
-// mirrors trusted-router-py `_telemetry.py` (RequestRecorder, host_enum,
-// classify_transport_error, resolve_telemetry_enabled).
+// the per-attempt `x-tr-client` request header (§3.2), the closed vocabulary
+// (§5.2), the opt-out resolution (§6.3), and the per-call recorder that
+// derives the §5.3 event and the exact §5.4 counter increments from the real
+// attempt history. It mirrors trusted-router-py `_telemetry.py`
+// (RequestRecorder, host_enum, endpoint_enum, classify_transport_error,
+// resolve_telemetry_enabled, sdk_identity).
 //
-// The BEACON channel (§4–§5) is deliberately absent: §9 step 7 ships
-// header-only PRs in the non-Python SDKs, and §10 forbids beacons in a
-// second SDK until the Python contract has been live and calibrated.
-// absoluteRequest (transport.go) is the reserved out-of-engine attach point
-// for that later beacon sender (§6.1); the parity constants below pin the
-// vocabulary it will use.
+// The BEACON channel (§4–§5, §6.2) — buffering, sampling, minute windows and
+// the out-of-engine POST to /client-events — lives in telemetry_reporter.go
+// (TelemetryReporter in the reference). The owner's decision of 2026-08-21
+// ships beacons in every SDK now, superseding the §9 step 7 / §10 "Python
+// first" ordering.
 //
 // Telemetry never fails a request (§2.2): every recorder method is
-// nil-receiver safe, and an out-of-grammar header value sends NOTHING
-// rather than panicking or erroring.
+// nil-receiver safe and recovers its own panics, and an out-of-grammar header
+// value sends NOTHING rather than panicking or erroring.
 
 import (
 	"context"
@@ -29,23 +30,57 @@ import (
 	"os"
 	"reflect"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
 
 const (
-	// telemetrySchemaVersion pins the beacon schema version (§5.1) for the
-	// later beacon PR; the header grammar pins v=1 independently (§3.2).
+	// telemetrySchemaVersion is the beacon schema version (§5.1); the
+	// header grammar pins v=1 independently (§3.2).
 	telemetrySchemaVersion = 1
-	// telemetryEventsPath pins the beacon POST path (§4) for the later
-	// beacon PR.
+	// telemetryEventsPath is the beacon POST path under the control base
+	// (§4): POST {control_base}/client-events.
 	telemetryEventsPath = "/client-events"
 	// telemetryMaxHeaderBytes bounds the whole x-tr-client header (§3.2).
 	telemetryMaxHeaderBytes = 160
 	// telemetryMaxDurationMS clamps every duration field (§3.2, §5.3).
 	telemetryMaxDurationMS = 3_600_000
+	// telemetryMaxAgeMS clamps age_ms and window_start_age_ms (§5.3, §5.4).
+	telemetryMaxAgeMS = 86_400_000
+	// telemetryMaxEventAttempts caps the attempts carried by one event
+	// (§5.3: 1..16).
+	telemetryMaxEventAttempts = 16
+	// telemetryMaxCount bounds every counter count (§5.4: ≤10 000 000).
+	telemetryMaxCount = 10_000_000
+
+	// Reporter bounds (§6.2), pinned by TestTelemetryParityConstants
+	// against trusted-router-py _constants.py.
+	telemetryFlushInterval     = 30 * time.Second
+	telemetryMaxEvents         = 1000
+	telemetryMaxBatchEvents    = 100
+	telemetryMaxBatchCounters  = 200
+	telemetryMaxWindowKeys     = 256
+	telemetryRetentionSeconds  = 86_400
+	telemetryRetentionBytes    = 524_288
+	telemetryBackoffMin        = 60 * time.Second
+	telemetryBackoffMax        = 600 * time.Second
+	telemetryBatchTriggerBytes = 60 * 1024
+	telemetryMaxBatchBytes     = 65_536
+	telemetryMaxRetryAfter     = 600 * time.Second
+	telemetryMaxPause          = 86_400 * time.Second
+	telemetryURGENTEvents      = 50
+	// telemetryHTTPTimeout bounds one beacon POST (py: httpx.Client(timeout=5.0)).
+	telemetryHTTPTimeout = 5 * time.Second
+	// telemetryCloseTimeout bounds the final flush on Close (§6.2: ≤2 s).
+	telemetryCloseTimeout = 2 * time.Second
+	// telemetrySlowMS is the §5.3 sampling threshold for slow successes.
+	telemetrySlowMS = 30_000
+	// telemetryDefaultSampleRate is the §5.3 default success_sample_rate.
+	telemetryDefaultSampleRate = 0.01
 )
 
 // Closed enum vocabulary (§5.2), pinned byte-for-byte by
@@ -98,6 +133,34 @@ var (
 		"stream_stalled",
 		"unknown",
 	}
+	telemetryFinalOutcomes = append(append([]string(nil), telemetryOutcomes...), "exhausted")
+	telemetryTimeoutPhases = []string{
+		"none",
+		"connect",
+		"first_byte",
+		"idle",
+		"total",
+	}
+	telemetryLatencyBuckets = []string{
+		"lt100",
+		"lt200",
+		"lt400",
+		"lt800",
+		"lt1600",
+		"lt3200",
+		"lt6400",
+		"lt12800",
+		"lt25600",
+		"lt51200",
+		"lt102400",
+		"ge102400",
+	}
+	// telemetryLatencyUpperBounds are the exclusive upper bounds of the
+	// lt* buckets, in order.
+	telemetryLatencyUpperBounds = []int64{100, 200, 400, 800, 1600, 3200, 6400, 12800, 25600, 51200, 102400}
+	telemetryHTTPStatusClasses  = []string{"none", "2xx", "4xx", "429", "5xx"}
+	telemetryErrorSources       = []string{"router", "provider", "unknown"}
+	telemetrySampleReasons      = []string{"failure", "retried", "slow", "random"}
 )
 
 // telemetryHostCustom is the fail-closed host value: a host telemetry cannot
@@ -140,6 +203,14 @@ var (
 	// telemetryRuntimeTokenRe is the §5.1 runtime grammar; the User-Agent
 	// runtime token (§3.1) must satisfy it or be omitted.
 	telemetryRuntimeTokenRe = regexp.MustCompile(`^[a-z]{1,10}/[0-9A-Za-z.+-]{1,24}$`)
+	// telemetryModelRe is the §5.3 model grammar: anything else is null,
+	// so free text can never ride the model field.
+	telemetryModelRe = regexp.MustCompile(`^[A-Za-z0-9._:/~@-]{1,128}$`)
+	// telemetryRequestIDRe is the §3.3 enclave audit id shape.
+	telemetryRequestIDRe = regexp.MustCompile(`^rlog_[0-9a-f]{32}$`)
+	// telemetrySemverRe bounds the SDK version in the batch identity (§5.1).
+	telemetrySemverRe = regexp.MustCompile(`^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)` +
+		`(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$`)
 )
 
 // telemetrySchemeHost splits a URL into its lowercased scheme and hostname,
@@ -533,26 +604,281 @@ func clampDurationMS(d time.Duration) int64 {
 	return ms
 }
 
-// telemetryAttempt is the header-channel subset of the per-attempt facts
-// (§3.2): index, host enum, outcome, error class, and elapsed time. The
-// beacon-only fields (http_status, ttfb, request_id, retry_after,
-// should_retry) arrive with the beacon PR.
+// endpointEnum maps an inference-plane path to the closed Endpoint
+// vocabulary (§5.2), mirroring trusted-router-py endpoint_enum: four exact
+// matches, four prefix families, everything else inference_other. The query
+// string and fragment are ignored and a trailing slash is trimmed.
+func endpointEnum(path string) string {
+	clean := path
+	if cut := strings.IndexAny(clean, "?#"); cut >= 0 {
+		clean = clean[:cut]
+	}
+	clean = strings.TrimRight(clean, "/")
+	if clean == "" {
+		clean = "/"
+	}
+	switch clean {
+	case "/chat/completions":
+		return "chat_completions"
+	case "/messages":
+		return "messages"
+	case "/responses":
+		return "responses"
+	case "/embeddings":
+		return "embeddings"
+	}
+	for _, family := range []struct{ prefix, endpoint string }{
+		{"/images", "images"},
+		{"/videos", "videos"},
+		{"/models", "models"},
+		{"/fusion", "fusion"},
+	} {
+		if clean == family.prefix || strings.HasPrefix(clean, family.prefix+"/") {
+			return family.endpoint
+		}
+	}
+	return "inference_other"
+}
+
+// latencyBucket maps milliseconds to the upper-bound-exclusive LatencyBucket
+// enum (§5.2).
+func latencyBucket(ms int64) string {
+	if ms < 0 {
+		ms = 0
+	}
+	for i, upper := range telemetryLatencyUpperBounds {
+		if ms < upper {
+			return telemetryLatencyBuckets[i]
+		}
+	}
+	return telemetryLatencyBuckets[len(telemetryLatencyBuckets)-1]
+}
+
+// statusClass maps an HTTP status (0 = no response) to HttpStatusClass (§5.2).
+func statusClass(status int) string {
+	switch {
+	case status >= 200 && status <= 299:
+		return "2xx"
+	case status == 429:
+		return "429"
+	case status >= 400 && status <= 499:
+		return "4xx"
+	case status >= 500 && status <= 599:
+		return "5xx"
+	default:
+		return "none"
+	}
+}
+
+// timeoutFloorMet reports whether the configured timeout for the phase meets
+// the §5.4 floor (connect ≥10 s, first_byte ≥60 s, idle ≥30 s).
+func timeoutFloorMet(phase string, configuredMS int64, hasConfigured bool) bool {
+	if !hasConfigured {
+		return false
+	}
+	switch phase {
+	case "connect":
+		return configuredMS >= 10_000
+	case "first_byte":
+		return configuredMS >= 60_000
+	case "idle":
+		return configuredMS >= 30_000
+	default:
+		return false
+	}
+}
+
+func clampInt64(value, minimum, maximum int64) int64 {
+	if value < minimum {
+		return minimum
+	}
+	if value > maximum {
+		return maximum
+	}
+	return value
+}
+
+func telemetryInSlice(values []string, value string) bool {
+	for _, candidate := range values {
+		if candidate == value {
+			return true
+		}
+	}
+	return false
+}
+
+// telemetryAttempt carries the per-attempt facts of §5.3 ClientAttempt plus
+// the attempt's timeout phase (used by the §5.4 attempt-level counter). The
+// header channel reads index/host/outcome/errorClass/elapsedMS; the beacon
+// reads everything. Optional fields use a has* flag or the empty string so
+// the struct stays comparable-by-value and copies cheaply.
 type telemetryAttempt struct {
-	index      int
-	host       string
-	outcome    string
-	errorClass string // "" renders as pc=none
-	elapsedMS  int64
+	index         int
+	host          string
+	outcome       string
+	httpStatus    int    // 0 renders as null
+	errorClass    string // "" renders as pc=none / null
+	errorSource   string // "" renders as null
+	shouldRetry   string // "true" | "false" | "absent" ("" is absent)
+	retryAfterMS  int64
+	hasRetryAfter bool
+	elapsedMS     int64
+	ttfbMS        int64
+	hasTTFB       bool
+	requestID     string // "" renders as null
+	moved         bool
+	phase         string // TimeoutPhase of this attempt; "" is none
+}
+
+// telemetryRequestFacts are the bounded, content-free facts about ONE logical
+// call that the recorder needs before the first attempt: the endpoint enum,
+// the method, the model id (regex-bounded; anything else is dropped) and
+// whether the request pinned a provider. Mirrors what trusted-router-py
+// _recorder derives from the path and the JSON body.
+type telemetryRequestFacts struct {
+	endpoint       string
+	method         string
+	model          string
+	providerPinned bool
+}
+
+// telemetryRequestFactsFor derives the request facts from the path and the
+// not-yet-marshaled body. Only the "model" and "provider" keys of a map body
+// are consulted; raw (json.RawMessage / []byte) bodies are not parsed, so
+// they report no model and no pin — exactly as trusted-router-py, whose
+// request() only sees a Mapping.
+func telemetryRequestFactsFor(method, path string, body any) telemetryRequestFacts {
+	facts := telemetryRequestFacts{
+		endpoint: endpointEnum(path),
+		method:   strings.ToUpper(method),
+	}
+	fields, ok := body.(map[string]any)
+	if !ok {
+		return facts
+	}
+	if model, ok := fields["model"].(string); ok && telemetryModelRe.MatchString(model) {
+		facts.model = model
+	}
+	facts.providerPinned = telemetryProviderPinned(fields["provider"])
+	return facts
+}
+
+// telemetryProviderPinned mirrors trusted-router-py's
+// `provider.get("allow_fallbacks") is False`: only an explicit false pins.
+func telemetryProviderPinned(provider any) bool {
+	switch typed := provider.(type) {
+	case *ProviderPreferences:
+		return typed != nil && typed.AllowFallbacks != nil && !*typed.AllowFallbacks
+	case ProviderPreferences:
+		return typed.AllowFallbacks != nil && !*typed.AllowFallbacks
+	case map[string]any:
+		allow, ok := typed["allow_fallbacks"].(bool)
+		return ok && !allow
+	default:
+		return false
+	}
+}
+
+// telemetryRequestEvent is the recorder's account of one finished logical
+// call (§5.3 ClientRequestEvent before sampling and wire bounding).
+type telemetryRequestEvent struct {
+	endpoint             string
+	method               string
+	streaming            bool
+	providerPinned       bool
+	model                string // "" renders as null
+	attempts             []telemetryAttempt
+	finalOutcome         string
+	finalHTTPStatus      int // 0 renders as null
+	totalMS              int64
+	ttftMS               int64
+	hasTTFT              bool
+	failoverUsed         bool
+	timeoutPhase         string
+	configuredTimeoutMS  int64
+	hasConfiguredTimeout bool
+}
+
+// telemetryCounterKey is the exact 10-field §5.4 counter key (the fields
+// minus the counts and histograms; model is deliberately not part of it).
+// Its outcome is Outcome, never FinalOutcome: "exhausted" belongs only to
+// sampled request events (the executable schema wins over the prose typo).
+// errorClass "" is the null error class.
+type telemetryCounterKey struct {
+	level           string
+	endpoint        string
+	streaming       bool
+	host            string
+	outcome         string
+	errorClass      string
+	httpStatusClass string
+	timeoutPhase    string
+	timeoutFloorMet bool
+	providerPinned  bool
+}
+
+// telemetryCounterIncrement is one (key, counts) contribution to a minute
+// window; the reporter merges increments with equal keys.
+type telemetryCounterIncrement struct {
+	key                 telemetryCounterKey
+	requests            int
+	attempts            int
+	failoverUsed        int
+	firstAttemptSuccess int
+	totalMSHist         map[string]int
+	firstEventMSHist    map[string]int
+}
+
+// telemetrySink receives one finished logical call: the event and its exact
+// counter increments. The production sink is telemetryReporter; tests inject
+// a recording sink.
+type telemetrySink interface {
+	onRequest(event telemetryRequestEvent, counters []telemetryCounterIncrement)
+}
+
+// telemetryOverflowEntry folds the attempt-level counter contribution of an
+// attempt whose record fell past the 16-attempt event cap (§5.3), so the
+// counters stay exact (§5.4) while recorder memory stays bounded under the
+// uncapped MaxRetries option.
+type telemetryOverflowEntry struct {
+	key      telemetryCounterKey
+	attempts int
+	moved    int
 }
 
 // requestRecorder records ONE logical inference call as the engine loop
-// (transport.go do()) runs, and assembles the x-tr-client value for the
-// attempt in flight. It mirrors trusted-router-py RequestRecorder's
-// begin_attempt / on_response / on_transport_error / on_moved /
-// header_value flow. All methods are nil-receiver safe so the engine wiring
-// stays unconditional (§2.2).
+// (transport.go do()) runs and the caller drains the body, assembles the
+// x-tr-client value for the attempt in flight, and on finish derives the
+// §5.3 event and the exact §5.4 counter increments (mirroring
+// trusted-router-py RequestRecorder's begin_attempt / on_response /
+// on_transport_error / on_moved / on_first_event / on_aborted / header_value
+// / _finish flow). All methods are nil-receiver safe so the engine wiring
+// stays unconditional (§2.2), and every method takes the recorder's own
+// mutex: the body wrapper may be read and closed from different goroutines.
 type requestRecorder struct {
-	streaming      bool
+	mu sync.Mutex
+
+	sink                 telemetrySink
+	endpoint             string
+	method               string
+	streaming            bool
+	providerPinned       bool
+	model                string
+	configuredTimeoutMS  int64
+	hasConfiguredTimeout bool
+	recordable           bool
+
+	// attempts holds the first telemetryMaxEventAttempts records by index —
+	// exactly what the wire event may carry. Records past that cap live only
+	// in lastAttempt until superseded, then fold into overflow as counter
+	// contributions, so memory stays bounded under the uncapped MaxRetries
+	// option while the counters still count every attempt.
+	attempts        []telemetryAttempt
+	overflow        []telemetryOverflowEntry
+	foldedIndex     int
+	recorded        int
+	firstErrorClass string
+
 	lastAttempt    telemetryAttempt
 	hasLastAttempt bool
 	// nextIndex counts attempts STARTED, independently of attempts
@@ -568,10 +894,35 @@ type requestRecorder struct {
 	currentHost  string
 	currentIndex int
 	begun        bool
+	ttftMS       int64
+	hasTTFT      bool
+	exhausted    bool
+	finished     bool
 }
 
-func newRequestRecorder(streaming bool) *requestRecorder {
-	return &requestRecorder{streaming: streaming}
+// newRequestRecorder builds the recorder for one logical call. A nil sink
+// records nothing beyond the header channel. Only GET and POST calls to a
+// known inference endpoint are recordable: the beacon schema admits no
+// other method (the contract's executable module, not its prose, wins).
+func newRequestRecorder(sink telemetrySink, facts telemetryRequestFacts, streaming bool, timeout time.Duration, hasTimeout bool) *requestRecorder {
+	r := &requestRecorder{
+		sink:           sink,
+		endpoint:       facts.endpoint,
+		method:         strings.ToUpper(facts.method),
+		streaming:      streaming,
+		providerPinned: facts.providerPinned,
+		foldedIndex:    -1,
+	}
+	if telemetryModelRe.MatchString(facts.model) {
+		r.model = facts.model
+	}
+	if hasTimeout && timeout > 0 {
+		r.configuredTimeoutMS = clampInt64(timeout.Milliseconds(), 1, telemetryMaxDurationMS)
+		r.hasConfiguredTimeout = true
+	}
+	r.recordable = telemetryInSlice(telemetryEndpoints, r.endpoint) &&
+		(r.method == http.MethodGet || r.method == http.MethodPost)
+	return r
 }
 
 // recoverTelemetryPanic is deferred by every recorder callback: telemetry
@@ -587,6 +938,8 @@ func (r *requestRecorder) beginAttempt(baseURL string) {
 	if r == nil {
 		return
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	defer recoverTelemetryPanic()
 	// Order matters, and both of these come before anything that can panic.
 	// The index advances first so a panic below cannot make the next attempt
@@ -596,6 +949,7 @@ func (r *requestRecorder) beginAttempt(baseURL string) {
 	r.currentIndex = r.nextIndex
 	r.nextIndex++
 	r.currentHost = telemetryHostCustom
+	r.foldOverflowLocked()
 	now := time.Now()
 	if !r.begun {
 		r.firstStarted = now
@@ -605,84 +959,436 @@ func (r *requestRecorder) beginAttempt(baseURL string) {
 	r.currentHost = hostEnum(baseURL)
 }
 
+// telemetryShouldRetry reads x-should-retry as observed: "true", "false", or
+// "absent" for anything else.
+func telemetryShouldRetry(headers http.Header) string {
+	switch strings.ToLower(strings.TrimSpace(headers.Get("X-Should-Retry"))) {
+	case "true":
+		return "true"
+	case "false":
+		return "false"
+	default:
+		return "absent"
+	}
+}
+
+// telemetryRequestID reads x-request-id when it is an enclave audit id
+// (§3.3); anything else is dropped, never forwarded.
+func telemetryRequestID(headers http.Header) string {
+	value := strings.TrimSpace(headers.Get("X-Request-Id"))
+	if telemetryRequestIDRe.MatchString(value) {
+		return value
+	}
+	return ""
+}
+
 // onResponse records an attempt that produced an HTTP response.
-func (r *requestRecorder) onResponse(statusCode int) {
-	if r == nil || !r.begun {
+func (r *requestRecorder) onResponse(statusCode int, headers http.Header) {
+	if r == nil {
 		return
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	defer recoverTelemetryPanic()
+	if !r.begun {
+		return
+	}
 	outcome := "http_error"
 	if statusCode < 400 {
 		outcome = "ok"
 	}
-	r.storeAttempt(telemetryAttempt{
-		index:     r.currentIndex,
-		host:      r.currentHost,
-		outcome:   outcome,
-		elapsedMS: clampDurationMS(time.Since(r.attemptStart)),
-	})
+	elapsed := clampDurationMS(time.Since(r.attemptStart))
+	attempt := telemetryAttempt{
+		index:       r.currentIndex,
+		host:        r.currentHost,
+		outcome:     outcome,
+		httpStatus:  statusCode,
+		shouldRetry: telemetryShouldRetry(headers),
+		elapsedMS:   elapsed,
+		ttfbMS:      elapsed,
+		hasTTFB:     true,
+		requestID:   telemetryRequestID(headers),
+		phase:       "none",
+	}
+	if seconds := retryAfterSeconds(headers); seconds != nil {
+		attempt.retryAfterMS = clampInt64(int64(*seconds*1000), 0, telemetryMaxDurationMS)
+		attempt.hasRetryAfter = true
+	}
+	r.storeAttempt(attempt)
 }
 
 // onTransportError records an attempt that died in transport. openTimedOut
 // reports that the stream-open timer fired, which the surfaced error chain
 // alone cannot say (the cancel cause arrives as a plain cancellation).
-func (r *requestRecorder) onTransportError(err error, openTimedOut bool) {
-	if r == nil || !r.begun {
+// responseOpened and bodyStarted describe how far the attempt got, exactly
+// as trusted-router-py's drivers report them: a failure after the first
+// body event is stream_broken (or an idle stall), and a failure after the
+// headers keeps the status and ttfb already recorded for this attempt.
+func (r *requestRecorder) onTransportError(err error, openTimedOut, responseOpened, bodyStarted bool) {
+	if r == nil {
 		return
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	defer recoverTelemetryPanic()
-	var outcome, errorClass string
-	if openTimedOut {
-		outcome = "timeout"
+	if !r.begun {
+		return
+	}
+	var errorClass, phase string
+	timedOut := false
+	switch {
+	case openTimedOut:
+		timedOut = true
 		// Bounded chain here too: this runs on the same caller-supplied
 		// error value as classifyTransportError, so it must not traverse
 		// with errors.As either.
 		if chainHas(telemetryErrorChain(err), isDialOpLink) {
-			errorClass = "connect_timeout"
+			errorClass, phase = "connect_timeout", "connect"
 		} else {
-			errorClass = "read_timeout"
+			errorClass, phase = "read_timeout", "first_byte"
 		}
-	} else {
+	case linkIs(err, errStreamIdleTimeout):
+		// The SDK's own idle-timeout sentinel: a read that stalled after
+		// the stream opened.
+		timedOut = true
+		errorClass, phase = "read_timeout", "first_byte"
+	default:
 		errorClass = classifyTransportError(err)
 		switch errorClass {
-		case "connect_timeout", "read_timeout", "write_timeout":
+		case "connect_timeout":
+			timedOut, phase = true, "connect"
+		case "read_timeout", "write_timeout":
 			// trusted-router-py maps every httpx.TimeoutException to the
 			// "timeout" outcome; mirror that for the Go timeout classes.
-			outcome = "timeout"
+			timedOut, phase = true, "first_byte"
 		default:
-			outcome = "transport_error"
+			phase = "none"
 		}
 	}
-	r.storeAttempt(telemetryAttempt{
+	var outcome string
+	switch {
+	case timedOut:
+		outcome = "timeout"
+		if bodyStarted {
+			phase = "idle"
+			if errorClass == "read_timeout" {
+				errorClass = "stream_stalled"
+			}
+		}
+	case bodyStarted:
+		outcome = "stream_broken"
+	default:
+		outcome = "transport_error"
+	}
+	attempt := telemetryAttempt{
 		index:      r.currentIndex,
 		host:       r.currentHost,
 		outcome:    outcome,
 		errorClass: errorClass,
 		elapsedMS:  clampDurationMS(time.Since(r.attemptStart)),
-	})
+		phase:      phase,
+	}
+	if previous := r.currentRecordLocked(); previous != nil {
+		if responseOpened {
+			attempt.httpStatus = previous.httpStatus
+			attempt.ttfbMS, attempt.hasTTFB = previous.ttfbMS, previous.hasTTFB
+		}
+		attempt.errorSource = previous.errorSource
+		attempt.shouldRetry = previous.shouldRetry
+		attempt.retryAfterMS, attempt.hasRetryAfter = previous.retryAfterMS, previous.hasRetryAfter
+		attempt.requestID = previous.requestID
+	}
+	r.storeAttempt(attempt)
 }
 
 // onMoved marks that the candidate index advanced after the last recorded
-// attempt (§3.2 fo). failoverUsed is a fact about the CALL, so it is set even
-// when the attempt that moved lost its record: fo describes whether this call
-// ever left its first host, and answering "no" because a record was dropped
-// would be a false report.
+// attempt (§3.2 fo, §5.3 moved). failoverUsed is a fact about the CALL, so it
+// is set even when the attempt that moved lost its record: fo describes
+// whether this call ever left its first host, and answering "no" because a
+// record was dropped would be a false report. The per-attempt moved flag is
+// set only on this attempt's own record.
 func (r *requestRecorder) onMoved() {
 	if r == nil {
 		return
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	defer recoverTelemetryPanic()
 	r.failoverUsed = true
+	if previous := r.currentRecordLocked(); previous != nil {
+		previous.moved = true
+		for i := range r.attempts {
+			if r.attempts[i].index == previous.index {
+				r.attempts[i].moved = true
+			}
+		}
+	}
 }
 
-// storeAttempt retains only the attempt in flight. Header assembly reads only
-// the immediately preceding attempt, so keeping the full history would make
-// recorder memory grow with the uncapped MaxRetries option for no wire-level
-// benefit. The record carries its own index so a callback panic still leaves a
-// detectable gap rather than causing an older attempt to be misreported.
+// onFirstEvent records time-to-first-token: the first SSE event of the
+// stream, measured from the start of the FIRST attempt (§5.3 ttft_ms). Only
+// the SSE decoder (sse.go) can observe it (§6.1).
+func (r *requestRecorder) onFirstEvent() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	defer recoverTelemetryPanic()
+	if !r.begun || r.hasTTFT {
+		return
+	}
+	r.ttftMS = clampDurationMS(time.Since(r.firstStarted))
+	r.hasTTFT = true
+}
+
+// onAborted records that the caller abandoned the call — its context ended,
+// or it stopped consuming the stream — replacing the in-flight attempt's
+// outcome with "aborted" while keeping every fact already observed for it.
+func (r *requestRecorder) onAborted() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	defer recoverTelemetryPanic()
+	if !r.begun {
+		return
+	}
+	attempt := telemetryAttempt{
+		index:     r.currentIndex,
+		host:      r.currentHost,
+		outcome:   "aborted",
+		elapsedMS: clampDurationMS(time.Since(r.attemptStart)),
+		phase:     "none",
+	}
+	if previous := r.currentRecordLocked(); previous != nil {
+		attempt.httpStatus = previous.httpStatus
+		attempt.errorClass = previous.errorClass
+		attempt.errorSource = previous.errorSource
+		attempt.shouldRetry = previous.shouldRetry
+		attempt.retryAfterMS, attempt.hasRetryAfter = previous.retryAfterMS, previous.hasRetryAfter
+		attempt.ttfbMS, attempt.hasTTFB = previous.ttfbMS, previous.hasTTFB
+		attempt.requestID = previous.requestID
+		attempt.moved = previous.moved
+		attempt.phase = previous.phase
+	}
+	r.storeAttempt(attempt)
+}
+
+// markExhausted records that the engine gave up on a retryable failure
+// after more than one attempt (§5.3 final_outcome exhausted).
+func (r *requestRecorder) markExhausted(exhausted bool) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.exhausted = exhausted
+}
+
+// currentRecordLocked returns the record of the attempt in flight, or nil
+// when that attempt has no record yet (or lost it to a recovered panic).
+func (r *requestRecorder) currentRecordLocked() *telemetryAttempt {
+	if r.hasLastAttempt && r.lastAttempt.index == r.currentIndex {
+		return &r.lastAttempt
+	}
+	return nil
+}
+
+// storeAttempt stores or replaces the record for attempt.index. The record
+// carries its own index so a callback panic still leaves a detectable gap
+// rather than causing an older attempt to be misreported.
 func (r *requestRecorder) storeAttempt(attempt telemetryAttempt) {
+	if attempt.phase == "" {
+		attempt.phase = "none"
+	}
+	if attempt.shouldRetry == "" {
+		attempt.shouldRetry = "absent"
+	}
+	replaced := r.hasLastAttempt && r.lastAttempt.index == attempt.index
+	stored := false
+	for i := range r.attempts {
+		if r.attempts[i].index == attempt.index {
+			r.attempts[i] = attempt
+			stored = true
+		}
+	}
+	if !stored && !replaced && len(r.attempts) < telemetryMaxEventAttempts {
+		r.attempts = append(r.attempts, attempt)
+	}
+	if !replaced {
+		r.recorded++
+	}
+	if r.firstErrorClass == "" && attempt.errorClass != "" {
+		r.firstErrorClass = attempt.errorClass
+	}
 	r.lastAttempt = attempt
 	r.hasLastAttempt = true
+}
+
+// foldOverflowLocked folds the last record into the overflow counters when
+// it fell past the event cap and has not been folded yet.
+func (r *requestRecorder) foldOverflowLocked() {
+	if !r.hasLastAttempt || r.lastAttempt.index == r.foldedIndex {
+		return
+	}
+	for _, attempt := range r.attempts {
+		if attempt.index == r.lastAttempt.index {
+			return
+		}
+	}
+	key := r.attemptCounterKeyLocked(r.lastAttempt)
+	r.foldedIndex = r.lastAttempt.index
+	for i := range r.overflow {
+		if r.overflow[i].key == key {
+			r.overflow[i].attempts++
+			if r.lastAttempt.moved {
+				r.overflow[i].moved++
+			}
+			return
+		}
+	}
+	entry := telemetryOverflowEntry{key: key, attempts: 1}
+	if r.lastAttempt.moved {
+		entry.moved = 1
+	}
+	r.overflow = append(r.overflow, entry)
+}
+
+// configuredTimeoutForLocked mirrors trusted-router-py _configured_timeout_ms
+// for an httpx.Timeout: the connect phase reports the connect timeout and
+// the first_byte/idle phases the read timeout; other phases report nothing.
+// This SDK has ONE per-attempt timeout, which bounds connection
+// establishment, the wait for headers, and (for streams) the idle gap, so
+// it is the configured value for every timed phase.
+func (r *requestRecorder) configuredTimeoutForLocked(phase string) (int64, bool) {
+	switch phase {
+	case "connect", "first_byte", "idle":
+		if r.hasConfiguredTimeout {
+			return r.configuredTimeoutMS, true
+		}
+	}
+	return 0, false
+}
+
+func (r *requestRecorder) attemptCounterKeyLocked(attempt telemetryAttempt) telemetryCounterKey {
+	phase := attempt.phase
+	if phase == "" {
+		phase = "none"
+	}
+	configuredMS, hasConfigured := r.configuredTimeoutForLocked(phase)
+	return telemetryCounterKey{
+		level:           "attempt",
+		endpoint:        r.endpoint,
+		streaming:       r.streaming,
+		host:            attempt.host,
+		outcome:         attempt.outcome,
+		errorClass:      attempt.errorClass,
+		httpStatusClass: statusClass(attempt.httpStatus),
+		timeoutPhase:    phase,
+		timeoutFloorMet: timeoutFloorMet(phase, configuredMS, hasConfigured),
+		providerPinned:  r.providerPinned,
+	}
+}
+
+// finish closes the logical call: it derives the §5.3 event and the exact
+// §5.4 counter increments from the real attempt history and hands them to
+// the sink, exactly once. Mirrors trusted-router-py RequestRecorder._finish.
+func (r *requestRecorder) finish() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	defer recoverTelemetryPanic()
+	if r.finished {
+		return
+	}
+	r.finished = true
+	if !r.recordable || r.sink == nil || !r.begun || !r.hasLastAttempt {
+		return
+	}
+	r.foldOverflowLocked()
+	final := r.lastAttempt
+	finalOutcome := final.outcome
+	if r.exhausted && r.recorded > 1 && final.outcome != "ok" {
+		finalOutcome = "exhausted"
+	}
+	timeoutPhase := final.phase
+	if timeoutPhase == "" {
+		timeoutPhase = "none"
+	}
+	configuredMS, hasConfigured := r.configuredTimeoutForLocked(timeoutPhase)
+	totalMS := clampDurationMS(time.Since(r.firstStarted))
+	event := telemetryRequestEvent{
+		endpoint:             r.endpoint,
+		method:               r.method,
+		streaming:            r.streaming,
+		providerPinned:       r.providerPinned,
+		model:                r.model,
+		attempts:             append([]telemetryAttempt(nil), r.attempts...),
+		finalOutcome:         finalOutcome,
+		finalHTTPStatus:      final.httpStatus,
+		totalMS:              totalMS,
+		ttftMS:               r.ttftMS,
+		hasTTFT:              r.hasTTFT,
+		failoverUsed:         r.failoverUsed,
+		timeoutPhase:         timeoutPhase,
+		configuredTimeoutMS:  configuredMS,
+		hasConfiguredTimeout: hasConfigured,
+	}
+	first := final
+	if len(r.attempts) > 0 {
+		first = r.attempts[0]
+	}
+	request := telemetryCounterIncrement{
+		key: telemetryCounterKey{
+			level:           "request",
+			endpoint:        r.endpoint,
+			streaming:       r.streaming,
+			host:            final.host,
+			outcome:         final.outcome,
+			errorClass:      r.firstErrorClass,
+			httpStatusClass: statusClass(final.httpStatus),
+			timeoutPhase:    timeoutPhase,
+			timeoutFloorMet: timeoutFloorMet(timeoutPhase, configuredMS, hasConfigured),
+			providerPinned:  r.providerPinned,
+		},
+		requests:    1,
+		attempts:    r.recorded,
+		totalMSHist: map[string]int{latencyBucket(totalMS): 1},
+	}
+	if r.failoverUsed {
+		request.failoverUsed = 1
+	}
+	if first.outcome == "ok" {
+		request.firstAttemptSuccess = 1
+	}
+	switch {
+	case r.hasTTFT:
+		request.firstEventMSHist = map[string]int{latencyBucket(r.ttftMS): 1}
+	case final.hasTTFB:
+		request.firstEventMSHist = map[string]int{latencyBucket(final.ttfbMS): 1}
+	}
+	counters := make([]telemetryCounterIncrement, 0, 1+len(r.attempts)+len(r.overflow))
+	counters = append(counters, request)
+	for _, attempt := range r.attempts {
+		increment := telemetryCounterIncrement{key: r.attemptCounterKeyLocked(attempt), requests: 1, attempts: 1}
+		if attempt.moved {
+			increment.failoverUsed = 1
+		}
+		counters = append(counters, increment)
+	}
+	for _, entry := range r.overflow {
+		counters = append(counters, telemetryCounterIncrement{
+			key:          entry.key,
+			requests:     entry.attempts,
+			attempts:     entry.attempts,
+			failoverUsed: entry.moved,
+		})
+	}
+	r.sink.onRequest(event, counters)
 }
 
 // headerValue assembles the §3.2 grammar for the attempt in flight, in the
@@ -692,6 +1398,11 @@ func (r *requestRecorder) storeAttempt(attempt telemetryAttempt) {
 // may never fail a request (§2.2), so an out-of-grammar header is dropped
 // here, not surfaced.
 func (r *requestRecorder) headerValue() (value string) {
+	if r == nil {
+		return ""
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	defer func() {
 		// Belt and braces for §2.2: even a recorder bug must cost the
 		// caller nothing but a missing telemetry header.
@@ -699,7 +1410,7 @@ func (r *requestRecorder) headerValue() (value string) {
 			value = ""
 		}
 	}()
-	if r == nil || !r.begun || r.currentHost == telemetryHostCustom {
+	if !r.begun || r.currentHost == telemetryHostCustom {
 		return ""
 	}
 	if r.currentIndex > 99 {
@@ -769,4 +1480,139 @@ func (r *requestRecorder) headerValue() (value string) {
 		}
 	}
 	return header
+}
+
+// telemetryBody is the outermost wrapper around a response body returned by
+// the engine when a recorder is active. The logical call is not over when
+// do() returns — the caller still drains the body — so this is where the
+// recorder learns about mid-body failures (§5.3 stream_broken, idle
+// stalls), caller aborts, and the moment the call is finished. It also
+// carries the SSE decoder's hooks: sse.go finds it by type assertion on the
+// reader it was handed and reports the first event (ttft) and an early stop.
+type telemetryBody struct {
+	io.ReadCloser
+	recorder *requestRecorder
+	ctx      context.Context
+
+	mu          sync.Mutex
+	bodyStarted bool
+	sawEOF      bool
+	done        bool
+}
+
+func newTelemetryBody(ctx context.Context, body io.ReadCloser, recorder *requestRecorder) io.ReadCloser {
+	return &telemetryBody{ReadCloser: body, recorder: recorder, ctx: ctx}
+}
+
+func (b *telemetryBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err != nil {
+		b.observeReadError(err)
+	}
+	return n, err
+}
+
+func (b *telemetryBody) observeReadError(err error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if err == io.EOF {
+		b.sawEOF = true
+		return
+	}
+	if b.done {
+		return
+	}
+	b.done = true
+	if b.ctx.Err() != nil {
+		b.recorder.onAborted()
+	} else {
+		b.recorder.onTransportError(err, false, true, b.bodyStarted)
+	}
+	b.recorder.finish()
+}
+
+// Close finishes the logical call. A close while the caller's context has
+// ended and the body had not been drained is a caller abort.
+func (b *telemetryBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.done {
+		b.done = true
+		if b.ctx.Err() != nil && !b.sawEOF {
+			b.recorder.onAborted()
+		}
+	}
+	b.recorder.finish()
+	return err
+}
+
+// onFirstEvent is the SSE decoder's hook for the first event of the stream.
+func (b *telemetryBody) onFirstEvent() {
+	b.mu.Lock()
+	b.bodyStarted = true
+	b.mu.Unlock()
+	b.recorder.onFirstEvent()
+}
+
+// onAborted is the SSE decoder's hook for a consumer that stopped iterating
+// before the stream ended (the Go shape of a closed generator).
+func (b *telemetryBody) onAborted() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.done {
+		return
+	}
+	b.done = true
+	b.recorder.onAborted()
+}
+
+// telemetrySDKIdentity builds the bounded SDK identity of §5.1 for this
+// process, mirroring trusted-router-py sdk_identity: every field is a closed
+// enum or an anchored, length-bounded token, with the same fallbacks.
+func telemetrySDKIdentity() telemetryWireSDK {
+	version := Version
+	if len(version) > 32 || !telemetrySemverRe.MatchString(version) {
+		version = "0.0.0"
+	}
+	runtimeToken := "go/" + strings.TrimPrefix(runtime.Version(), "go")
+	if !telemetryRuntimeTokenRe.MatchString(runtimeToken) {
+		runtimeToken = "go/0.0.0"
+	}
+	return telemetryWireSDK{
+		Name:    "tr-go",
+		Version: version,
+		Lang:    "go",
+		Runtime: runtimeToken,
+		OS:      telemetryOSEnum(runtime.GOOS),
+		Arch:    telemetryArchEnum(runtime.GOARCH),
+	}
+}
+
+func telemetryOSEnum(goos string) string {
+	switch goos {
+	case "darwin":
+		return "macos"
+	case "linux", "windows", "ios", "android", "freebsd":
+		return goos
+	default:
+		return "other"
+	}
+}
+
+func telemetryArchEnum(goarch string) string {
+	switch goarch {
+	case "amd64":
+		return "x64"
+	case "386":
+		return "x32"
+	case "arm":
+		return "arm"
+	case "arm64":
+		return "arm64"
+	case "wasm":
+		return "wasm"
+	default:
+		return "other"
+	}
 }
