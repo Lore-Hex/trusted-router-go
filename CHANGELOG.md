@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.4.0 — 2026-08-22
+
+- Added the `/v1/client-events` beacon channel (client telemetry contract v1
+  §4, §5, §6.2–§6.4), completing the telemetry work begun in 0.3.0. A
+  telemetry reporter batches sampled request events and exact per-minute
+  counters and posts them with its own HTTP client — never the caller's and
+  never the inference transport. Buffers are bounded and drop the oldest
+  success first; counter keys fold (error class, then endpoint, then an
+  existing key) rather than growing without limit; batches are trimmed to the
+  byte cap. The server's response governs the client: a volume-reducing
+  policy is honoured, 400/401/403/404/410 disables the reporter for the
+  process, 413 drops the batch, and backoff runs 60s to 10min honouring
+  `Retry-After`. New sample-rate option (default 0.01) and a bounded final
+  flush on close.
+- The opt-out precedence from 0.3.0 governs both channels unchanged, prompt
+  and completion content is never recorded, and telemetry can never fail a
+  request.
+
 ## 0.3.0 — 2026-08-21
 
 - Send the `x-tr-client` client-observed reliability telemetry header (contract v1, header channel only). Content-free by construction — closed enums and bounded integers — never sent to custom base URLs or on control-plane calls, and disabled by `Telemetry: false` (new `Options.Telemetry *bool`), `TRUSTEDROUTER_TELEMETRY=0`, or `DO_NOT_TRACK=1`. Opting out does not change the User-Agent.
