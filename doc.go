@@ -4,6 +4,7 @@
 // messages, embeddings, Fusion orchestration, and gateway attestation on the
 // inference base. Model/provider/region catalogs, OAuth delegated-key helpers,
 // account and billing endpoints, broadcast destinations, and activity use the
-// control-plane base. Trust-release fetching and Confidential Space gateway
-// attestation verification are also included.
+// control-plane base. Trust-release fetching, Confidential Space gateway
+// attestation verification, and offline signed-receipt verification are also
+// included.
 package trustedrouter
