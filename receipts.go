@@ -261,9 +261,13 @@ type ReceiptClaims struct {
 // VerifyReceiptOptions configures VerifyReceipt. Nil byte slices and nil
 // pointers mean the corresponding optional check was not requested.
 type VerifyReceiptOptions struct {
-	RequestBody        []byte
-	ResponseBody       []byte
-	ResponseStream     []byte
+	RequestBody    []byte
+	ResponseBody   []byte
+	ResponseStream []byte
+	// Attestation supplies the exact GCP attestation-document bytes pinned by a
+	// compact receipt's att_sha256 claim. For a flattened receipt, supplied
+	// bytes must exactly match the document embedded in its protected header.
+	Attestation        []byte
 	ExpectedNonce      *string
 	MaxAgeSeconds      *float64
 	Now                *float64
@@ -285,6 +289,11 @@ type receiptSSEEvent struct {
 }
 
 // VerifyReceipt verifies a compact or flattened v1 inference receipt.
+//
+// Compact receipts carry only an att_sha256 pin. Fetch /receipt-attestation
+// and retry when necessary until SHA-256 of the returned per-instance document
+// matches that pin, then pass its exact bytes in VerifyReceiptOptions.Attestation.
+// Flattened receipts carry the document in their protected header.
 func VerifyReceipt(receipt any, opts VerifyReceiptOptions) (*ReceiptClaims, error) {
 	envelope, err := parseReceiptEnvelope(receipt)
 	if err != nil {
@@ -491,7 +500,7 @@ func VerifyReceipt(receipt any, opts VerifyReceiptOptions) (*ReceiptClaims, erro
 	if opts.RequireAttestation != nil {
 		requireAttestation = *opts.RequireAttestation
 	}
-	attestationStatus, err := verifyReceiptAttestation(envelope, header, publicKey, requireAttestation)
+	attestationStatus, err := verifyReceiptAttestation(envelope, header, publicKey, opts.Attestation, attSHA256, requireAttestation)
 	if err != nil {
 		return nil, err
 	}
@@ -816,31 +825,51 @@ func embeddedReceiptFromPayload(payload []byte) (map[string]any, error) {
 }
 
 var receiptPolicyFromTrustRelease = PolicyFromTrustRelease
-var receiptVerifyGatewayAttestation = VerifyGatewayAttestation
+var receiptVerifyReceiptKeyAttestation = VerifyReceiptKeyAttestation
 
-func verifyReceiptAttestation(envelope receiptEnvelope, header map[string]any, publicKey []byte, require bool) (string, error) {
+func verifyReceiptAttestation(envelope receiptEnvelope, header map[string]any, publicKey []byte, suppliedAttestation []byte, attSHA256 string, require bool) (string, error) {
+	var attestation []byte
 	if !envelope.flattened {
-		if require {
+		if suppliedAttestation == nil {
+			if !require {
+				return ReceiptAttestationUnverified, nil
+			}
 			return "", receiptMissingAttestation("attestation check failed: compact receipts omit attestation evidence; obtain the pinned document or explicitly set RequireAttestation to false")
 		}
-		return ReceiptAttestationUnverified, nil
-	}
-	kind, kindOK := header["att_kind"].(string)
-	if kind == "aws-nitro-cose" || kind == "azure-maa-jwt" {
-		return "", receiptUnsupportedAttestation(fmt.Sprintf("attestation kind check failed: %q is not supported by this SDK", kind))
-	}
-	if !kindOK || kind == "" {
-		if _, present := header["att_kind"]; !present || header["att_kind"] == nil {
-			return "", receiptMissingAttestation("attestation check failed: flattened receipt has no att_kind")
+		if attSHA256 == "" {
+			return "", receiptMissingAttestation("attestation check failed: compact receipt has no att_sha256 claim")
 		}
-		return "", receiptUnsupportedAttestation(fmt.Sprintf("attestation kind check failed: unsupported att_kind %s", receiptRepr(header["att_kind"])))
-	}
-	if kind != "gcp-cs-jwt" {
-		return "", receiptUnsupportedAttestation(fmt.Sprintf("attestation kind check failed: unsupported att_kind %q", kind))
-	}
-	attestation, ok := header["att"].(string)
-	if !ok || attestation == "" {
-		return "", receiptMissingAttestation("attestation check failed: flattened receipt has no embedded att")
+		expectedDigest, err := receiptB64URLDecode(attSHA256, "att_sha256 claim")
+		if err != nil {
+			return "", receiptAttestation(err.Error(), err)
+		}
+		actualDigest := sha256.Sum256(suppliedAttestation)
+		if !hmac.Equal(actualDigest[:], expectedDigest) {
+			return "", receiptAttestation("att_sha256 check failed: supplied attestation does not match the compact receipt", nil)
+		}
+		attestation = suppliedAttestation
+	} else {
+		kind, kindOK := header["att_kind"].(string)
+		if kind == "aws-nitro-cose" || kind == "azure-maa-jwt" {
+			return "", receiptUnsupportedAttestation(fmt.Sprintf("attestation kind check failed: %q is not supported by this SDK", kind))
+		}
+		if !kindOK || kind == "" {
+			if _, present := header["att_kind"]; !present || header["att_kind"] == nil {
+				return "", receiptMissingAttestation("attestation check failed: flattened receipt has no att_kind")
+			}
+			return "", receiptUnsupportedAttestation(fmt.Sprintf("attestation kind check failed: unsupported att_kind %s", receiptRepr(header["att_kind"])))
+		}
+		if kind != "gcp-cs-jwt" {
+			return "", receiptUnsupportedAttestation(fmt.Sprintf("attestation kind check failed: unsupported att_kind %q", kind))
+		}
+		embedded, ok := header["att"].(string)
+		if !ok || embedded == "" {
+			return "", receiptMissingAttestation("attestation check failed: flattened receipt has no embedded att")
+		}
+		attestation = []byte(embedded)
+		if suppliedAttestation != nil && !hmac.Equal(suppliedAttestation, attestation) {
+			return "", receiptAttestation("attestation check failed: supplied attestation does not match the flattened receipt's embedded attestation", nil)
+		}
 	}
 	commitment := sha256.Sum256(append([]byte(receiptKeyCommitmentDomain), publicKey...))
 	ctx := context.Background()
@@ -848,9 +877,9 @@ func verifyReceiptAttestation(envelope receiptEnvelope, header map[string]any, p
 	if err != nil {
 		return "", receiptAttestation(fmt.Sprintf("GCP attestation check failed: %v", err), err)
 	}
-	_, err = receiptVerifyGatewayAttestation(ctx, []byte(attestation), VerifyGatewayAttestationOptions{
-		Policy:   policy,
-		NonceHex: hex.EncodeToString(commitment[:]),
+	err = receiptVerifyReceiptKeyAttestation(ctx, attestation, VerifyReceiptKeyAttestationOptions{
+		Policy:           policy,
+		KeyCommitmentHex: hex.EncodeToString(commitment[:]),
 	})
 	if err != nil {
 		return "", receiptAttestation(fmt.Sprintf("GCP attestation check failed: %v", err), err)

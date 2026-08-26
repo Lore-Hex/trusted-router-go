@@ -32,6 +32,13 @@ const ExporterLength = 32
 
 const defaultAttestationAudience = "quill-cloud"
 
+type attestationBindingMode uint8
+
+const (
+	attestationBindingLiveChannel attestationBindingMode = iota
+	attestationBindingReceiptKey
+)
+
 // AttestationVerificationError reports a failed attestation trust check.
 type AttestationVerificationError struct {
 	// Message is the Python-compatible verification failure text.
@@ -275,6 +282,22 @@ type VerifyGatewayAttestationOptions struct {
 	HTTPClient *http.Client
 }
 
+// VerifyReceiptKeyAttestationOptions configures VerifyReceiptKeyAttestation.
+type VerifyReceiptKeyAttestationOptions struct {
+	// Policy is the attestation policy to enforce.
+	Policy AttestationPolicy
+	// KeyCommitmentHex is sha256("inference-receipt-key-v1" || 0x00 || raw_pubkey),
+	// encoded as lowercase hexadecimal. It may occur anywhere in eat_nonce.
+	KeyCommitmentHex string
+	// JWKS is a pre-fetched JWKS. Nil fetches JWKSURL.
+	JWKS map[string]any
+	// JWKSURL is fetched when JWKS is nil. Empty uses GCPJWKSURI.
+	JWKSURL string
+	// HTTPClient is the HTTP client used when JWKS is nil. It is handled with
+	// the same credential-free metadata safeguards as gateway verification.
+	HTTPClient *http.Client
+}
+
 // Attestation fetches the gateway attestation JWT as raw bytes.
 func (c *Client) Attestation(ctx context.Context) ([]byte, error) {
 	resp, err := c.absoluteRequest(ctx, http.MethodGet, attestationURL(c.baseURL))
@@ -326,13 +349,35 @@ func FetchTrustRelease(ctx context.Context, trustURL string) (*TrustRelease, err
 
 // VerifyGatewayAttestation verifies a GCP Confidential Space attestation JWT.
 func VerifyGatewayAttestation(ctx context.Context, document []byte, opts VerifyGatewayAttestationOptions) (*GatewayAttestation, error) {
+	payload, err := verifiedAttestationJWTClaims(ctx, document, opts.JWKS, opts.JWKSURL, opts.HTTPClient)
+	if err != nil {
+		return nil, err
+	}
+	return checkAttestationClaimsForBinding(payload, opts.Policy, opts.NonceHex, opts.TLSCertDER, opts.TLSExporter, attestationBindingLiveChannel)
+}
+
+// VerifyReceiptKeyAttestation verifies a GCP Confidential Space attestation
+// that binds a durable receipt-signing key. It performs the same JWT signature,
+// issuer, audience, validity, debug, hardware, and image-policy checks as
+// VerifyGatewayAttestation, but deliberately performs no live TLS certificate,
+// exporter, or caller-nonce checks. The key commitment must be a member of the
+// token's eat_nonce set.
+func VerifyReceiptKeyAttestation(ctx context.Context, document []byte, opts VerifyReceiptKeyAttestationOptions) error {
+	payload, err := verifiedAttestationJWTClaims(ctx, document, opts.JWKS, opts.JWKSURL, opts.HTTPClient)
+	if err != nil {
+		return err
+	}
+	_, err = checkAttestationClaimsForBinding(payload, opts.Policy, opts.KeyCommitmentHex, nil, nil, attestationBindingReceiptKey)
+	return err
+}
+
+func verifiedAttestationJWTClaims(ctx context.Context, document []byte, jwks map[string]any, jwksURL string, httpClient *http.Client) (map[string]any, error) {
 	header, payload, signingInput, signature, err := jwtSplit(document)
 	if err != nil {
 		return nil, err
 	}
-	jwks := opts.JWKS
 	if jwks == nil {
-		jwks, err = fetchJWKS(ctx, opts.JWKSURL, opts.HTTPClient)
+		jwks, err = fetchJWKS(ctx, jwksURL, httpClient)
 		if err != nil {
 			return nil, err
 		}
@@ -340,7 +385,7 @@ func VerifyGatewayAttestation(ctx context.Context, document []byte, opts VerifyG
 	if err := verifyRS256(jwks, header, signingInput, signature); err != nil {
 		return nil, err
 	}
-	return checkAttestationClaims(payload, opts.Policy, opts.NonceHex, opts.TLSCertDER, opts.TLSExporter)
+	return payload, nil
 }
 
 func attestationURL(baseURL string) string {
@@ -550,6 +595,13 @@ func jwksKeys(jwks map[string]any) ([]map[string]any, bool) {
 }
 
 func checkAttestationClaims(claims map[string]any, policy AttestationPolicy, nonceHex string, tlsCertDER []byte, tlsExporter []byte) (*GatewayAttestation, error) {
+	return checkAttestationClaimsForBinding(claims, policy, nonceHex, tlsCertDER, tlsExporter, attestationBindingLiveChannel)
+}
+
+func checkAttestationClaimsForBinding(claims map[string]any, policy AttestationPolicy, nonceHex string, tlsCertDER []byte, tlsExporter []byte, bindingMode attestationBindingMode) (*GatewayAttestation, error) {
+	if bindingMode != attestationBindingLiveChannel && bindingMode != attestationBindingReceiptKey {
+		return nil, attestationErr(fmt.Sprintf("unsupported attestation binding mode %d", bindingMode), nil)
+	}
 	now := time.Now().Unix()
 	expValue, expOK := intClaim(claims["exp"])
 	if !expOK {
@@ -629,48 +681,60 @@ func checkAttestationClaims(claims map[string]any, policy AttestationPolicy, non
 
 	nonces := nonceList(claims)
 	var nonceMatch *string
-	if len(tlsExporter) > 0 && nonceHex == "" {
-		return nil, attestationErr("fresh nonce required with exporter binding", nil)
-	}
-	if nonceHex != "" {
-		if !containsString(nonces, nonceHex) {
-			return nil, attestationErr(fmt.Sprintf("nonce %s not present in JWT nonces %s", pyRepr(nonceHex), pyRepr(nonces)), nil)
+	if bindingMode == attestationBindingReceiptKey {
+		receiptNonces := stringListClaim(claims["eat_nonce"])
+		if !containsFoldedSafeString(receiptNonces, nonceHex) {
+			return nil, attestationErr(fmt.Sprintf("nonce %s not present in JWT nonces %s", pyRepr(nonceHex), pyRepr(receiptNonces)), nil)
 		}
 		nonce := nonceHex
 		nonceMatch = &nonce
-	}
-	if len(tlsExporter) > 0 {
-		exporterHex := fmt.Sprintf("%x", tlsExporter)
-		if !containsString(nonces, exporterHex) {
-			return nil, attestationErr(fmt.Sprintf("TLS exporter %s not present in JWT nonces %s", pyRepr(exporterHex), pyRepr(nonces)), nil)
+	} else {
+		if len(tlsExporter) > 0 && nonceHex == "" {
+			return nil, attestationErr("fresh nonce required with exporter binding", nil)
 		}
-		// G6/RFC 9266 relay closure: the caller nonce must consume the enclave's
-		// one external nonce slot independently from the TLS exporter commitment.
-		if safeEq(nonceHex, exporterHex) {
-			return nil, attestationErr("fresh nonce must be distinct from TLS exporter for G6 relay closure", nil)
+		if nonceHex != "" {
+			if !containsString(nonces, nonceHex) {
+				return nil, attestationErr(fmt.Sprintf("nonce %s not present in JWT nonces %s", pyRepr(nonceHex), pyRepr(nonces)), nil)
+			}
+			nonce := nonceHex
+			nonceMatch = &nonce
+		}
+		if len(tlsExporter) > 0 {
+			exporterHex := fmt.Sprintf("%x", tlsExporter)
+			if !containsString(nonces, exporterHex) {
+				return nil, attestationErr(fmt.Sprintf("TLS exporter %s not present in JWT nonces %s", pyRepr(exporterHex), pyRepr(nonces)), nil)
+			}
+			// G6/RFC 9266 relay closure: the caller nonce must consume the enclave's
+			// one external nonce slot independently from the TLS exporter commitment.
+			if safeEq(nonceHex, exporterHex) {
+				return nil, attestationErr("fresh nonce must be distinct from TLS exporter for G6 relay closure", nil)
+			}
 		}
 	}
 
-	certSHA, _ := claims["tls_cert_sha256"].(string)
-	if certSHA == "" {
-		certSHA, _ = claims["workload_tls_cert_sha256"].(string)
-	}
-	if certSHA == "" {
-		certSHA = findCertInNonces(nonces, tlsCertDER)
-	}
-	if len(certSHA) != 64 {
-		return nil, attestationErr("JWT does not commit to a TLS cert SHA-256 — cannot bind connection", nil)
-	}
-	certSHA = strings.ToLower(certSHA)
-
-	if tlsCertDER != nil {
-		actual := sha256Hex(tlsCertDER)
-		if !safeEq(actual, certSHA) {
-			return nil, attestationErr(fmt.Sprintf("TLS cert mismatch: connection=%s, JWT=%s", pyRepr(actual), pyRepr(certSHA)), nil)
+	certSHA := ""
+	if bindingMode == attestationBindingLiveChannel {
+		certSHA, _ = claims["tls_cert_sha256"].(string)
+		if certSHA == "" {
+			certSHA, _ = claims["workload_tls_cert_sha256"].(string)
 		}
-	}
-	if policy.ExpectedCertSHA256 != "" && !safeEq(certSHA, strings.ToLower(policy.ExpectedCertSHA256)) {
-		return nil, attestationErr("JWT-committed cert SHA-256 doesn't match policy pin", nil)
+		if certSHA == "" {
+			certSHA = findCertInNonces(nonces, tlsCertDER)
+		}
+		if len(certSHA) != 64 {
+			return nil, attestationErr("JWT does not commit to a TLS cert SHA-256 — cannot bind connection", nil)
+		}
+		certSHA = strings.ToLower(certSHA)
+
+		if tlsCertDER != nil {
+			actual := sha256Hex(tlsCertDER)
+			if !safeEq(actual, certSHA) {
+				return nil, attestationErr(fmt.Sprintf("TLS cert mismatch: connection=%s, JWT=%s", pyRepr(actual), pyRepr(certSHA)), nil)
+			}
+		}
+		if policy.ExpectedCertSHA256 != "" && !safeEq(certSHA, strings.ToLower(policy.ExpectedCertSHA256)) {
+			return nil, attestationErr("JWT-committed cert SHA-256 doesn't match policy pin", nil)
+		}
 	}
 
 	var expPtr *int
@@ -792,6 +856,16 @@ func safeEq(a, b string) bool {
 func containsSafeString(values []string, target string) bool {
 	for _, value := range values {
 		if safeEq(value, target) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsFoldedSafeString(values []string, target string) bool {
+	target = strings.ToLower(target)
+	for _, value := range values {
+		if safeEq(strings.ToLower(value), target) {
 			return true
 		}
 	}

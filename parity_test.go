@@ -106,6 +106,7 @@ func TestParityCompileReference(t *testing.T) {
 		AttestationVerificationError{},
 		PolicyFromTrustReleaseOptions{},
 		VerifyGatewayAttestationOptions{},
+		VerifyReceiptKeyAttestationOptions{},
 	}
 
 	_ = []any{
@@ -120,6 +121,7 @@ func TestParityCompileReference(t *testing.T) {
 		FetchTrustRelease,
 		PolicyFromTrustRelease,
 		VerifyGatewayAttestation,
+		VerifyReceiptKeyAttestation,
 	}
 
 	_ = []any{

@@ -245,6 +245,19 @@ header scrub and can still alter the outgoing request.
 The `trustedrouter attest --verify` CLI command performs the TLS certificate
 fetch and full verification flow.
 
+## Receipt Verification
+
+`VerifyReceipt` verifies compact and flattened inference receipts. Flattened
+receipts embed their signing-key attestation. Compact receipts carry only an
+`att_sha256` claim, so pass the exact separately fetched document in
+`VerifyReceiptOptions.Attestation` (or explicitly set `RequireAttestation` to
+false for signature-and-hashes-only verification).
+
+The `/receipt-attestation` endpoint serves the document for the instance that
+answers that fetch. When verifying a compact receipt, retry the fetch until
+SHA-256 of the returned bytes matches the receipt's `att_sha256` claim, then
+pass those unchanged bytes to `VerifyReceipt`.
+
 ## CLI
 
 ```sh

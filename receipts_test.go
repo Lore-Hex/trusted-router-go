@@ -166,16 +166,16 @@ func makeStreamReceipt(t *testing.T, eventsClaim int) (map[string]any, []byte) {
 func stubReceiptAttestation(t *testing.T) {
 	t.Helper()
 	oldPolicy := receiptPolicyFromTrustRelease
-	oldVerify := receiptVerifyGatewayAttestation
+	oldVerify := receiptVerifyReceiptKeyAttestation
 	receiptPolicyFromTrustRelease = func(context.Context, PolicyFromTrustReleaseOptions) (AttestationPolicy, error) {
 		return AttestationPolicy{ExpectedImageDigest: "sha256:test"}, nil
 	}
-	receiptVerifyGatewayAttestation = func(context.Context, []byte, VerifyGatewayAttestationOptions) (*GatewayAttestation, error) {
-		return &GatewayAttestation{}, nil
+	receiptVerifyReceiptKeyAttestation = func(context.Context, []byte, VerifyReceiptKeyAttestationOptions) error {
+		return nil
 	}
 	t.Cleanup(func() {
 		receiptPolicyFromTrustRelease = oldPolicy
-		receiptVerifyGatewayAttestation = oldVerify
+		receiptVerifyReceiptKeyAttestation = oldVerify
 	})
 }
 
@@ -403,21 +403,21 @@ func TestReceiptGCPAttestationUsesKeyCommitmentSetMember(t *testing.T) {
 	delete(claims, "att_sha256")
 	signed := signTestReceipt(t, claims, true, nil, nil)
 	oldPolicy := receiptPolicyFromTrustRelease
-	oldVerify := receiptVerifyGatewayAttestation
+	oldVerify := receiptVerifyReceiptKeyAttestation
 	receiptPolicyFromTrustRelease = func(context.Context, PolicyFromTrustReleaseOptions) (AttestationPolicy, error) {
 		return AttestationPolicy{ExpectedImageDigest: "sha256:test"}, nil
 	}
 	var seenNonce string
-	receiptVerifyGatewayAttestation = func(_ context.Context, document []byte, opts VerifyGatewayAttestationOptions) (*GatewayAttestation, error) {
+	receiptVerifyReceiptKeyAttestation = func(_ context.Context, document []byte, opts VerifyReceiptKeyAttestationOptions) error {
 		if string(document) != "fake.jwt.token" {
 			t.Fatalf("attestation document = %q", document)
 		}
-		seenNonce = opts.NonceHex
-		return &GatewayAttestation{}, nil
+		seenNonce = opts.KeyCommitmentHex
+		return nil
 	}
 	t.Cleanup(func() {
 		receiptPolicyFromTrustRelease = oldPolicy
-		receiptVerifyGatewayAttestation = oldVerify
+		receiptVerifyReceiptKeyAttestation = oldVerify
 	})
 	now := float64(receiptTestNow)
 	verified, err := VerifyReceipt(signed.receipt, VerifyReceiptOptions{Now: &now})
@@ -428,6 +428,140 @@ func TestReceiptGCPAttestationUsesKeyCommitmentSetMember(t *testing.T) {
 	}
 	if verified.AttestationStatus != ReceiptAttestationVerified {
 		t.Fatalf("attestation status = %q", verified.AttestationStatus)
+	}
+}
+
+func TestReceiptKeyBindingAcceptsNonceMembershipWithoutLiveChannel(t *testing.T) {
+	for _, commitmentPosition := range []int{0, 2} {
+		t.Run(fmt.Sprintf("position_%d", commitmentPosition), func(t *testing.T) {
+			fixture := newAttestationFixture(t)
+			claims := baseReceiptClaims("body", []byte("response"))
+			delete(claims, "att_sha256")
+			signed := signTestReceipt(t, claims, true, nil, nil)
+			commitment := sha256.Sum256(append([]byte(receiptKeyCommitmentDomain), signed.publicKey...))
+			commitmentHex := hex.EncodeToString(commitment[:])
+			nonces := []string{strings.Repeat("a", 64), strings.Repeat("b", 64)}
+			nonces = append(nonces, "")
+			copy(nonces[commitmentPosition+1:], nonces[commitmentPosition:])
+			nonces[commitmentPosition] = commitmentHex
+			attestationClaims := fixture.claims(map[string]any{
+				"eat_nonce":       nonces,
+				"tls_cert_sha256": nil,
+			})
+
+			oldPolicy := receiptPolicyFromTrustRelease
+			oldVerify := receiptVerifyReceiptKeyAttestation
+			receiptPolicyFromTrustRelease = func(context.Context, PolicyFromTrustReleaseOptions) (AttestationPolicy, error) {
+				return fixture.policy, nil
+			}
+			receiptVerifyReceiptKeyAttestation = func(_ context.Context, document []byte, opts VerifyReceiptKeyAttestationOptions) error {
+				if string(document) != "fake.jwt.token" {
+					t.Fatalf("attestation document = %q", document)
+				}
+				_, err := checkAttestationClaimsForBinding(attestationClaims, opts.Policy, opts.KeyCommitmentHex, nil, nil, attestationBindingReceiptKey)
+				return err
+			}
+			t.Cleanup(func() {
+				receiptPolicyFromTrustRelease = oldPolicy
+				receiptVerifyReceiptKeyAttestation = oldVerify
+			})
+
+			now := float64(receiptTestNow)
+			verified, err := VerifyReceipt(signed.receipt, VerifyReceiptOptions{Now: &now})
+			requireNoReceiptError(t, err)
+			if verified.AttestationStatus != ReceiptAttestationVerified {
+				t.Fatalf("attestation status = %q", verified.AttestationStatus)
+			}
+
+			_, err = checkAttestationClaims(attestationClaims, fixture.policy, commitmentHex, nil, nil)
+			if err == nil || !strings.Contains(err.Error(), "TLS cert") {
+				t.Fatalf("live-channel check error = %v, want TLS cert binding failure", err)
+			}
+		})
+	}
+}
+
+func TestReceiptKeyBindingRejectsWrongCommitment(t *testing.T) {
+	fixture := newAttestationFixture(t)
+	claims := baseReceiptClaims("body", []byte("response"))
+	delete(claims, "att_sha256")
+	signed := signTestReceipt(t, claims, true, nil, nil)
+	attestationClaims := fixture.claims(map[string]any{
+		"eat_nonce":       []string{strings.Repeat("a", 64), strings.Repeat("b", 64), strings.Repeat("c", 64)},
+		"tls_cert_sha256": nil,
+	})
+
+	oldPolicy := receiptPolicyFromTrustRelease
+	oldVerify := receiptVerifyReceiptKeyAttestation
+	receiptPolicyFromTrustRelease = func(context.Context, PolicyFromTrustReleaseOptions) (AttestationPolicy, error) {
+		return fixture.policy, nil
+	}
+	receiptVerifyReceiptKeyAttestation = func(_ context.Context, _ []byte, opts VerifyReceiptKeyAttestationOptions) error {
+		_, err := checkAttestationClaimsForBinding(attestationClaims, opts.Policy, opts.KeyCommitmentHex, nil, nil, attestationBindingReceiptKey)
+		return err
+	}
+	t.Cleanup(func() {
+		receiptPolicyFromTrustRelease = oldPolicy
+		receiptVerifyReceiptKeyAttestation = oldVerify
+	})
+
+	now := float64(receiptTestNow)
+	_, err := VerifyReceipt(signed.receipt, VerifyReceiptOptions{Now: &now})
+	if !receiptErrorIs[*ReceiptAttestationError](err) || !strings.Contains(err.Error(), "not present in JWT nonces") {
+		t.Fatalf("got %T (%v), want nonce-membership ReceiptAttestationError", err, err)
+	}
+}
+
+func TestCompactReceiptVerifiesSuppliedPinnedAttestation(t *testing.T) {
+	document := []byte("attestation")
+	oldPolicy := receiptPolicyFromTrustRelease
+	oldVerify := receiptVerifyReceiptKeyAttestation
+	receiptPolicyFromTrustRelease = func(context.Context, PolicyFromTrustReleaseOptions) (AttestationPolicy, error) {
+		return AttestationPolicy{ExpectedImageDigest: "sha256:test"}, nil
+	}
+	receiptVerifyReceiptKeyAttestation = func(_ context.Context, got []byte, _ VerifyReceiptKeyAttestationOptions) error {
+		if !bytes.Equal(got, document) {
+			t.Fatalf("attestation document = %q, want %q", got, document)
+		}
+		return nil
+	}
+	t.Cleanup(func() {
+		receiptPolicyFromTrustRelease = oldPolicy
+		receiptVerifyReceiptKeyAttestation = oldVerify
+	})
+
+	claims := baseReceiptClaims("body", []byte("response"))
+	claims["att_sha256"] = testDigest(document)
+	signed := signTestReceipt(t, claims, false, nil, nil)
+	now := float64(receiptTestNow)
+
+	verified, err := VerifyReceipt(signed.receipt, VerifyReceiptOptions{Now: &now, Attestation: document})
+	requireNoReceiptError(t, err)
+	if verified.AttestationStatus != ReceiptAttestationVerified {
+		t.Fatalf("attestation status = %q", verified.AttestationStatus)
+	}
+
+	changed := append([]byte(nil), document...)
+	changed[len(changed)-1] ^= 1
+	_, err = VerifyReceipt(signed.receipt, VerifyReceiptOptions{Now: &now, Attestation: changed})
+	if !receiptErrorIs[*ReceiptAttestationError](err) || !strings.Contains(err.Error(), "att_sha256 check failed") {
+		t.Fatalf("got %T (%v), want att_sha256 ReceiptAttestationError", err, err)
+	}
+}
+
+func TestFlattenedReceiptRejectsMismatchedSuppliedAttestation(t *testing.T) {
+	stubReceiptAttestation(t)
+	claims := baseReceiptClaims("body", []byte("response"))
+	delete(claims, "att_sha256")
+	signed := signTestReceipt(t, claims, true, nil, nil)
+	now := float64(receiptTestNow)
+
+	_, err := VerifyReceipt(signed.receipt, VerifyReceiptOptions{
+		Now:         &now,
+		Attestation: []byte("fake.jwt.tokenx"),
+	})
+	if !receiptErrorIs[*ReceiptAttestationError](err) || !strings.Contains(err.Error(), "does not match the flattened receipt's embedded attestation") {
+		t.Fatalf("got %T (%v), want embedded-attestation mismatch", err, err)
 	}
 }
 
