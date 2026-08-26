@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"math/big"
 	"net/http"
@@ -83,6 +84,61 @@ func TestVerifyGatewayAttestationCertInNonces(t *testing.T) {
 	}
 	if got.CertSHA256 != fixture.certSHA {
 		t.Fatalf("CertSHA256 = %q, want %q", got.CertSHA256, fixture.certSHA)
+	}
+}
+
+func TestVerifyReceiptKeyAttestationUsesEatNonceSetWithoutChannelBinding(t *testing.T) {
+	fixture := newAttestationFixture(t)
+	commitment := strings.Repeat("c3", sha256.Size)
+
+	for _, commitmentPosition := range []int{0, 2} {
+		t.Run(fmt.Sprintf("position_%d", commitmentPosition), func(t *testing.T) {
+			nonces := []string{strings.Repeat("a", 64), strings.Repeat("b", 64)}
+			nonces = append(nonces, "")
+			copy(nonces[commitmentPosition+1:], nonces[commitmentPosition:])
+			nonces[commitmentPosition] = commitment
+			claims := fixture.claims(map[string]any{
+				"eat_nonce":       nonces,
+				"tls_cert_sha256": nil,
+			})
+			token := fixture.mint(t, claims)
+
+			err := VerifyReceiptKeyAttestation(context.Background(), token, VerifyReceiptKeyAttestationOptions{
+				Policy:           fixture.policy,
+				KeyCommitmentHex: commitment,
+				JWKS:             fixture.jwks,
+			})
+			if err != nil {
+				t.Fatalf("VerifyReceiptKeyAttestation returned error: %v", err)
+			}
+
+			_, err = VerifyGatewayAttestation(context.Background(), token, VerifyGatewayAttestationOptions{
+				Policy:   fixture.policy,
+				NonceHex: commitment,
+				JWKS:     fixture.jwks,
+			})
+			if err == nil || !strings.Contains(err.Error(), "TLS cert") {
+				t.Fatalf("live-channel verification error = %v, want TLS cert binding failure", err)
+			}
+		})
+	}
+}
+
+func TestVerifyReceiptKeyAttestationRejectsWrongCommitment(t *testing.T) {
+	fixture := newAttestationFixture(t)
+	claims := fixture.claims(map[string]any{
+		"eat_nonce":       []string{strings.Repeat("a", 64), strings.Repeat("b", 64), strings.Repeat("c", 64)},
+		"tls_cert_sha256": nil,
+	})
+	token := fixture.mint(t, claims)
+
+	err := VerifyReceiptKeyAttestation(context.Background(), token, VerifyReceiptKeyAttestationOptions{
+		Policy:           fixture.policy,
+		KeyCommitmentHex: strings.Repeat("d", 64),
+		JWKS:             fixture.jwks,
+	})
+	if err == nil || !strings.Contains(err.Error(), "not present in JWT nonces") {
+		t.Fatalf("VerifyReceiptKeyAttestation error = %v, want nonce-membership failure", err)
 	}
 }
 
