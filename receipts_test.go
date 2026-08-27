@@ -12,15 +12,20 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
 
-const receiptTestNow = int64(1756224000)
+const (
+	receiptTestNow    = int64(1756224000)
+	receiptTestIssuer = "https://api.trustedrouter.com"
+)
 
 func stringPointer(value string) *string     { return &value }
+func boolPointer(value bool) *bool           { return &value }
 func testB64URL(value []byte) string         { return base64.RawURLEncoding.EncodeToString(value) }
 func testDigest(value []byte) string         { digest := sha256.Sum256(value); return testB64URL(digest[:]) }
 func receiptErrorIs[T error](err error) bool { var target T; return errors.As(err, &target) }
@@ -42,7 +47,7 @@ func baseReceiptClaims(responseOf string, responsePreimage []byte) map[string]an
 	}
 	return map[string]any{
 		"rv":    1,
-		"iss":   "https://api.trustedrouter.com",
+		"iss":   receiptTestIssuer,
 		"iat":   receiptTestNow,
 		"jti":   "chatcmpl-test",
 		"gen":   "gen-test",
@@ -84,10 +89,23 @@ func signTestReceipt(
 	signingOverride ed25519.PrivateKey,
 ) signedTestReceipt {
 	t.Helper()
-	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("GenerateKey: %v", err)
 	}
+	return signTestReceiptWithKey(t, claims, flattened, headerUpdates, privateKey, signingOverride)
+}
+
+func signTestReceiptWithKey(
+	t *testing.T,
+	claims map[string]any,
+	flattened bool,
+	headerUpdates map[string]any,
+	privateKey ed25519.PrivateKey,
+	signingOverride ed25519.PrivateKey,
+) signedTestReceipt {
+	t.Helper()
+	publicKey := privateKey.Public().(ed25519.PublicKey)
 	header := map[string]any{
 		"alg": "EdDSA",
 		"typ": receiptType,
@@ -219,7 +237,7 @@ func TestReceiptFrozenFixtures(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			verified, err := VerifyReceipt(receipt, opts)
+			verified, err := VerifyReceipt(receipt, receiptTestIssuer, opts)
 			requireNoReceiptError(t, err)
 			if verified.RV != 1 {
 				t.Fatalf("RV = %d, want 1", verified.RV)
@@ -228,17 +246,181 @@ func TestReceiptFrozenFixtures(t *testing.T) {
 	}
 }
 
+func TestReceiptBindingsAreRequiredByDefaultAndCanBeDisabled(t *testing.T) {
+	signed := signTestReceipt(t, baseReceiptClaims("body", []byte("response")), false, nil, nil)
+	now := float64(receiptTestNow)
+	withoutAttestation := boolPointer(false)
+
+	_, err := VerifyReceipt(signed.receipt, receiptTestIssuer, VerifyReceiptOptions{
+		Now:                &now,
+		RequireAttestation: withoutAttestation,
+	})
+	if !receiptErrorIs[*MissingBindingError](err) || !receiptErrorIs[*ReceiptClaimsError](err) ||
+		!strings.Contains(err.Error(), "missing request_body and response_body or response_stream") {
+		t.Fatalf("got %T (%v), want MissingBindingError naming both missing bindings", err, err)
+	}
+
+	verified, err := VerifyReceipt(signed.receipt, receiptTestIssuer, VerifyReceiptOptions{
+		Now:                &now,
+		RequireAttestation: withoutAttestation,
+		RequireBindings:    boolPointer(false),
+	})
+	requireNoReceiptError(t, err)
+	if verified.Issuer != receiptTestIssuer {
+		t.Fatalf("Issuer = %q, want %q", verified.Issuer, receiptTestIssuer)
+	}
+}
+
+func TestReceiptPartialBindingsFailClosedByDefault(t *testing.T) {
+	signed := signTestReceipt(t, baseReceiptClaims("body", []byte("response")), false, nil, nil)
+	now := float64(receiptTestNow)
+	withoutAttestation := boolPointer(false)
+
+	_, err := VerifyReceipt(signed.receipt, receiptTestIssuer, VerifyReceiptOptions{
+		RequestBody:        []byte("request"),
+		Now:                &now,
+		RequireAttestation: withoutAttestation,
+	})
+	if !receiptErrorIs[*MissingBindingError](err) || !strings.Contains(err.Error(), "missing response_body or response_stream") {
+		t.Fatalf("got %T (%v), want MissingBindingError naming response binding", err, err)
+	}
+
+	_, err = VerifyReceipt(signed.receipt, receiptTestIssuer, VerifyReceiptOptions{
+		ResponseBody:       []byte("response"),
+		Now:                &now,
+		RequireAttestation: withoutAttestation,
+	})
+	if !receiptErrorIs[*MissingBindingError](err) || !strings.Contains(err.Error(), "missing request_body") {
+		t.Fatalf("got %T (%v), want MissingBindingError naming request binding", err, err)
+	}
+}
+
+func TestReceiptIssuerPinningAndNormalization(t *testing.T) {
+	now := float64(receiptTestNow)
+	options := VerifyReceiptOptions{
+		Now:                &now,
+		RequireAttestation: boolPointer(false),
+		RequireBindings:    boolPointer(false),
+	}
+
+	signed := signTestReceipt(t, baseReceiptClaims("body", []byte("response")), false, nil, nil)
+	verified, err := VerifyReceipt(signed.receipt, receiptTestIssuer, options)
+	requireNoReceiptError(t, err)
+	if verified.Issuer != receiptTestIssuer {
+		t.Fatalf("Issuer = %q, want %q", verified.Issuer, receiptTestIssuer)
+	}
+	_, err = VerifyReceipt(signed.receipt, "https://other.example", options)
+	if !receiptErrorIs[*ReceiptIssuerError](err) || !receiptErrorIs[*ReceiptClaimsError](err) || !strings.Contains(err.Error(), "iss claim check failed: expected") {
+		t.Fatalf("got %T (%v), want typed issuer mismatch", err, err)
+	}
+
+	for _, testCase := range []struct {
+		name           string
+		receiptIssuer  string
+		expectedIssuer string
+	}{
+		{name: "host and scheme case with slash", receiptIssuer: "https://API.TrustedRouter.COM/", expectedIssuer: "HTTPS://api.trustedrouter.com"},
+		{name: "non-default port", receiptIssuer: "https://API.TrustedRouter.COM:8443/", expectedIssuer: "https://api.trustedrouter.com:8443"},
+		{name: "default port stripped", receiptIssuer: "https://API.TrustedRouter.COM:443/", expectedIssuer: receiptTestIssuer},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			claims := baseReceiptClaims("body", []byte("response"))
+			claims["iss"] = testCase.receiptIssuer
+			receipt := signTestReceipt(t, claims, false, nil, nil)
+			got, verifyErr := VerifyReceipt(receipt.receipt, testCase.expectedIssuer, options)
+			requireNoReceiptError(t, verifyErr)
+			if got.Issuer != testCase.receiptIssuer {
+				t.Fatalf("Issuer = %q, want original signed value %q", got.Issuer, testCase.receiptIssuer)
+			}
+		})
+	}
+
+	claims := baseReceiptClaims("body", []byte("response"))
+	claims["iss"] = receiptTestIssuer + ":8443"
+	wrongPort := signTestReceipt(t, claims, false, nil, nil)
+	_, err = VerifyReceipt(wrongPort.receipt, receiptTestIssuer, options)
+	if !receiptErrorIs[*ReceiptIssuerError](err) || !strings.Contains(err.Error(), "iss claim check failed: expected") {
+		t.Fatalf("got %T (%v), want issuer port mismatch", err, err)
+	}
+
+	claims["iss"] = "http://api.trustedrouter.com"
+	httpIssuer := signTestReceipt(t, claims, false, nil, nil)
+	_, err = VerifyReceipt(httpIssuer.receipt, receiptTestIssuer, options)
+	if !receiptErrorIs[*ReceiptIssuerError](err) || !strings.Contains(err.Error(), "must use https") {
+		t.Fatalf("got %T (%v), want HTTPS-only ReceiptIssuerError", err, err)
+	}
+}
+
+func TestReceiptIssuerIsNeverUsedToFetchVerificationMaterial(t *testing.T) {
+	const hostileIssuer = "https://evil.example"
+	fixture := newAttestationFixture(t)
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	commitment := sha256.Sum256(append([]byte(receiptKeyCommitmentDomain), publicKey...))
+	document := fixture.mint(t, fixture.claims(map[string]any{
+		"eat_nonce":       []string{hex.EncodeToString(commitment[:])},
+		"tls_cert_sha256": nil,
+	}))
+	claims := baseReceiptClaims("body", []byte("response"))
+	claims["iss"] = hostileIssuer
+	delete(claims, "att_sha256")
+	signed := signTestReceiptWithKey(t, claims, true, map[string]any{"att": string(document)}, privateKey, nil)
+
+	oldPolicy := receiptPolicyFromTrustRelease
+	oldVerify := receiptVerifyReceiptKeyAttestation
+	oldTransport := http.DefaultTransport
+	receiptPolicyFromTrustRelease = func(context.Context, PolicyFromTrustReleaseOptions) (AttestationPolicy, error) {
+		return fixture.policy, nil
+	}
+	receiptVerifyReceiptKeyAttestation = VerifyReceiptKeyAttestation
+	requestedURLs := make([]string, 0, 1)
+	http.DefaultTransport = attestationRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		requestedURLs = append(requestedURLs, request.URL.String())
+		if request.URL.Hostname() == "evil.example" {
+			t.Fatalf("receipt issuer was dereferenced for verification material: %s", request.URL)
+		}
+		if request.URL.String() != GCPJWKSURI {
+			return nil, fmt.Errorf("unexpected verification-material URL %s", request.URL)
+		}
+		encoded, marshalErr := json.Marshal(fixture.jwks)
+		if marshalErr != nil {
+			return nil, marshalErr
+		}
+		return attestationTestResponse(http.StatusOK, string(encoded)), nil
+	})
+	t.Cleanup(func() {
+		receiptPolicyFromTrustRelease = oldPolicy
+		receiptVerifyReceiptKeyAttestation = oldVerify
+		http.DefaultTransport = oldTransport
+	})
+
+	now := float64(receiptTestNow)
+	verified, err := VerifyReceipt(signed.receipt, hostileIssuer, VerifyReceiptOptions{
+		Now:             &now,
+		RequireBindings: boolPointer(false),
+	})
+	requireNoReceiptError(t, err)
+	if verified.Issuer != hostileIssuer {
+		t.Fatalf("Issuer = %q, want %q", verified.Issuer, hostileIssuer)
+	}
+	if len(requestedURLs) != 1 || requestedURLs[0] != GCPJWKSURI {
+		t.Fatalf("verification material URLs = %#v, want only %q", requestedURLs, GCPJWKSURI)
+	}
+}
+
 func TestReceiptTamperMatrix(t *testing.T) {
 	falseValue := false
 	now := float64(receiptTestNow)
-	baseOptions := VerifyReceiptOptions{Now: &now, RequireAttestation: &falseValue}
+	baseOptions := VerifyReceiptOptions{Now: &now, RequireAttestation: &falseValue, RequireBindings: &falseValue}
 
 	t.Run("flipped payload byte", func(t *testing.T) {
 		signed := signTestReceipt(t, baseReceiptClaims("body", []byte("response")), false, nil, nil)
 		payload, _ := base64.RawURLEncoding.DecodeString(signed.payload)
 		payload[len(payload)-2] ^= 1
 		tampered := signed.protected + "." + testB64URL(payload) + "." + signed.signature
-		_, err := VerifyReceipt(tampered, baseOptions)
+		_, err := VerifyReceipt(tampered, receiptTestIssuer, baseOptions)
 		if !receiptErrorIs[*ReceiptSignatureError](err) {
 			t.Fatalf("got %T (%v), want ReceiptSignatureError", err, err)
 		}
@@ -250,7 +432,7 @@ func TestReceiptTamperMatrix(t *testing.T) {
 			t.Fatal(err)
 		}
 		signed := signTestReceipt(t, baseReceiptClaims("body", []byte("response")), false, nil, wrongSigner)
-		_, err = VerifyReceipt(signed.receipt, baseOptions)
+		_, err = VerifyReceipt(signed.receipt, receiptTestIssuer, baseOptions)
 		if !receiptErrorIs[*ReceiptSignatureError](err) {
 			t.Fatalf("got %T (%v), want ReceiptSignatureError", err, err)
 		}
@@ -261,7 +443,7 @@ func TestReceiptTamperMatrix(t *testing.T) {
 		payload, _ := base64.RawURLEncoding.DecodeString(signed.payload)
 		edited := bytes.Replace(payload, []byte(`"selected":"model"`), []byte(`"selected":"other"`), 1)
 		tampered := signed.protected + "." + testB64URL(edited) + "." + signed.signature
-		_, err := VerifyReceipt(tampered, baseOptions)
+		_, err := VerifyReceipt(tampered, receiptTestIssuer, baseOptions)
 		if !receiptErrorIs[*ReceiptSignatureError](err) {
 			t.Fatalf("got %T (%v), want ReceiptSignatureError", err, err)
 		}
@@ -269,7 +451,7 @@ func TestReceiptTamperMatrix(t *testing.T) {
 
 	t.Run("wrong kid", func(t *testing.T) {
 		signed := signTestReceipt(t, baseReceiptClaims("body", []byte("response")), false, map[string]any{"kid": testDigest([]byte("wrong"))}, nil)
-		_, err := VerifyReceipt(signed.receipt, baseOptions)
+		_, err := VerifyReceipt(signed.receipt, receiptTestIssuer, baseOptions)
 		if !receiptErrorIs[*ReceiptHeaderError](err) {
 			t.Fatalf("got %T (%v), want ReceiptHeaderError", err, err)
 		}
@@ -279,7 +461,7 @@ func TestReceiptTamperMatrix(t *testing.T) {
 		stubReceiptAttestation(t)
 		receipt, stream := makeStreamReceipt(t, 1)
 		stream = bytes.Replace(stream, []byte("hello"), []byte("jello"), 1)
-		_, err := VerifyReceipt(receipt, VerifyReceiptOptions{Now: &now, ResponseStream: stream})
+		_, err := VerifyReceipt(receipt, receiptTestIssuer, VerifyReceiptOptions{RequestBody: []byte("request"), Now: &now, ResponseStream: stream})
 		if !receiptErrorIs[*ReceiptHashError](err) {
 			t.Fatalf("got %T (%v), want ReceiptHashError", err, err)
 		}
@@ -290,7 +472,7 @@ func TestReceiptTamperMatrix(t *testing.T) {
 		receipt, stream := makeStreamReceipt(t, 1)
 		extra := []byte("data: {\"choices\":[]}\n\n")
 		stream = bytes.Replace(stream, []byte("data: [DONE]"), append(extra, []byte("data: [DONE]")...), 1)
-		_, err := VerifyReceipt(receipt, VerifyReceiptOptions{Now: &now, ResponseStream: stream})
+		_, err := VerifyReceipt(receipt, receiptTestIssuer, VerifyReceiptOptions{RequestBody: []byte("request"), Now: &now, ResponseStream: stream})
 		if !receiptErrorIs[*ReceiptHashError](err) || !strings.Contains(err.Error(), "not the last") {
 			t.Fatalf("got %T (%v), want last-position ReceiptHashError", err, err)
 		}
@@ -299,7 +481,7 @@ func TestReceiptTamperMatrix(t *testing.T) {
 	t.Run("events off by one", func(t *testing.T) {
 		stubReceiptAttestation(t)
 		receipt, stream := makeStreamReceipt(t, 2)
-		_, err := VerifyReceipt(receipt, VerifyReceiptOptions{Now: &now, ResponseStream: stream})
+		_, err := VerifyReceipt(receipt, receiptTestIssuer, VerifyReceiptOptions{RequestBody: []byte("request"), Now: &now, ResponseStream: stream})
 		if !receiptErrorIs[*ReceiptHashError](err) || !strings.Contains(err.Error(), "events check") {
 			t.Fatalf("got %T (%v), want events ReceiptHashError", err, err)
 		}
@@ -309,7 +491,7 @@ func TestReceiptTamperMatrix(t *testing.T) {
 		claims := baseReceiptClaims("body", []byte("response"))
 		claims["iat"] = receiptTestNow + 61
 		signed := signTestReceipt(t, claims, false, nil, nil)
-		_, err := VerifyReceipt(signed.receipt, baseOptions)
+		_, err := VerifyReceipt(signed.receipt, receiptTestIssuer, baseOptions)
 		if !receiptErrorIs[*ReceiptTimeError](err) {
 			t.Fatalf("got %T (%v), want ReceiptTimeError", err, err)
 		}
@@ -319,7 +501,7 @@ func TestReceiptTamperMatrix(t *testing.T) {
 		claims := baseReceiptClaims("body", []byte("response"))
 		claims["upstream"].(map[string]any)["verification_expires_at"] = receiptTestNow
 		signed := signTestReceipt(t, claims, false, nil, nil)
-		_, err := VerifyReceipt(signed.receipt, baseOptions)
+		_, err := VerifyReceipt(signed.receipt, receiptTestIssuer, baseOptions)
 		if !receiptErrorIs[*ReceiptUpstreamError](err) {
 			t.Fatalf("got %T (%v), want ReceiptUpstreamError", err, err)
 		}
@@ -329,7 +511,7 @@ func TestReceiptTamperMatrix(t *testing.T) {
 		signed := signTestReceipt(t, baseReceiptClaims("body", []byte("response")), false, nil, nil)
 		options := baseOptions
 		options.ExpectedNonce = stringPointer("different")
-		_, err := VerifyReceipt(signed.receipt, options)
+		_, err := VerifyReceipt(signed.receipt, receiptTestIssuer, options)
 		if !receiptErrorIs[*ReceiptNonceError](err) {
 			t.Fatalf("got %T (%v), want ReceiptNonceError", err, err)
 		}
@@ -339,7 +521,7 @@ func TestReceiptTamperMatrix(t *testing.T) {
 		claims := baseReceiptClaims("body", []byte("response"))
 		delete(claims, "att_sha256")
 		signed := signTestReceipt(t, claims, true, map[string]any{"att_kind": "aws-nitro-cose"}, nil)
-		_, err := VerifyReceipt(signed.receipt, baseOptions)
+		_, err := VerifyReceipt(signed.receipt, receiptTestIssuer, baseOptions)
 		if !receiptErrorIs[*UnsupportedAttestationError](err) {
 			t.Fatalf("got %T (%v), want UnsupportedAttestationError", err, err)
 		}
@@ -347,7 +529,7 @@ func TestReceiptTamperMatrix(t *testing.T) {
 
 	t.Run("missing attestation defaults to required", func(t *testing.T) {
 		signed := signTestReceipt(t, baseReceiptClaims("body", []byte("response")), false, nil, nil)
-		_, err := VerifyReceipt(signed.receipt, VerifyReceiptOptions{Now: &now})
+		_, err := VerifyReceipt(signed.receipt, receiptTestIssuer, VerifyReceiptOptions{Now: &now, RequireBindings: &falseValue})
 		if !receiptErrorIs[*MissingAttestationError](err) {
 			t.Fatalf("got %T (%v), want MissingAttestationError", err, err)
 		}
@@ -371,7 +553,7 @@ func TestReceiptTamperMatrix(t *testing.T) {
 		header := fmt.Sprintf(`{"alg":"EdDSA","typ":%q,"kid":%q,"jwk":{"kty":"OKP","crv":"Ed25519","x":%q}}`, receiptType, testDigest(publicKey), testB64URL(publicKey))
 		protected := testB64URL([]byte(header))
 		signature := testB64URL(ed25519.Sign(privateKey, []byte(protected+"."+encoded)))
-		_, err = VerifyReceipt(protected+"."+encoded+"."+signature, baseOptions)
+		_, err = VerifyReceipt(protected+"."+encoded+"."+signature, receiptTestIssuer, baseOptions)
 		if !receiptErrorIs[*ReceiptStructureError](err) {
 			t.Fatalf("got %T (%v), want ReceiptStructureError", err, err)
 		}
@@ -390,7 +572,7 @@ func TestReceiptStreamingFramingFailures(t *testing.T) {
 	}
 	for name, candidate := range cases {
 		t.Run(name, func(t *testing.T) {
-			_, err := VerifyReceipt(receipt, VerifyReceiptOptions{Now: &now, ResponseStream: candidate})
+			_, err := VerifyReceipt(receipt, receiptTestIssuer, VerifyReceiptOptions{RequestBody: []byte("request"), Now: &now, ResponseStream: candidate})
 			if !receiptErrorIs[*ReceiptHashError](err) {
 				t.Fatalf("got %T (%v), want ReceiptHashError", err, err)
 			}
@@ -420,7 +602,7 @@ func TestReceiptGCPAttestationUsesKeyCommitmentSetMember(t *testing.T) {
 		receiptVerifyReceiptKeyAttestation = oldVerify
 	})
 	now := float64(receiptTestNow)
-	verified, err := VerifyReceipt(signed.receipt, VerifyReceiptOptions{Now: &now})
+	verified, err := VerifyReceipt(signed.receipt, receiptTestIssuer, VerifyReceiptOptions{Now: &now, RequireBindings: boolPointer(false)})
 	requireNoReceiptError(t, err)
 	commitment := sha256.Sum256(append([]byte(receiptKeyCommitmentDomain), signed.publicKey...))
 	if seenNonce != hex.EncodeToString(commitment[:]) {
@@ -467,7 +649,7 @@ func TestReceiptKeyBindingAcceptsNonceMembershipWithoutLiveChannel(t *testing.T)
 			})
 
 			now := float64(receiptTestNow)
-			verified, err := VerifyReceipt(signed.receipt, VerifyReceiptOptions{Now: &now})
+			verified, err := VerifyReceipt(signed.receipt, receiptTestIssuer, VerifyReceiptOptions{Now: &now, RequireBindings: boolPointer(false)})
 			requireNoReceiptError(t, err)
 			if verified.AttestationStatus != ReceiptAttestationVerified {
 				t.Fatalf("attestation status = %q", verified.AttestationStatus)
@@ -506,7 +688,7 @@ func TestReceiptKeyBindingRejectsWrongCommitment(t *testing.T) {
 	})
 
 	now := float64(receiptTestNow)
-	_, err := VerifyReceipt(signed.receipt, VerifyReceiptOptions{Now: &now})
+	_, err := VerifyReceipt(signed.receipt, receiptTestIssuer, VerifyReceiptOptions{Now: &now, RequireBindings: boolPointer(false)})
 	if !receiptErrorIs[*ReceiptAttestationError](err) || !strings.Contains(err.Error(), "not present in JWT nonces") {
 		t.Fatalf("got %T (%v), want nonce-membership ReceiptAttestationError", err, err)
 	}
@@ -535,7 +717,7 @@ func TestCompactReceiptVerifiesSuppliedPinnedAttestation(t *testing.T) {
 	signed := signTestReceipt(t, claims, false, nil, nil)
 	now := float64(receiptTestNow)
 
-	verified, err := VerifyReceipt(signed.receipt, VerifyReceiptOptions{Now: &now, Attestation: document})
+	verified, err := VerifyReceipt(signed.receipt, receiptTestIssuer, VerifyReceiptOptions{Now: &now, Attestation: document, RequireBindings: boolPointer(false)})
 	requireNoReceiptError(t, err)
 	if verified.AttestationStatus != ReceiptAttestationVerified {
 		t.Fatalf("attestation status = %q", verified.AttestationStatus)
@@ -543,7 +725,7 @@ func TestCompactReceiptVerifiesSuppliedPinnedAttestation(t *testing.T) {
 
 	changed := append([]byte(nil), document...)
 	changed[len(changed)-1] ^= 1
-	_, err = VerifyReceipt(signed.receipt, VerifyReceiptOptions{Now: &now, Attestation: changed})
+	_, err = VerifyReceipt(signed.receipt, receiptTestIssuer, VerifyReceiptOptions{Now: &now, Attestation: changed, RequireBindings: boolPointer(false)})
 	if !receiptErrorIs[*ReceiptAttestationError](err) || !strings.Contains(err.Error(), "att_sha256 check failed") {
 		t.Fatalf("got %T (%v), want att_sha256 ReceiptAttestationError", err, err)
 	}
@@ -556,9 +738,10 @@ func TestFlattenedReceiptRejectsMismatchedSuppliedAttestation(t *testing.T) {
 	signed := signTestReceipt(t, claims, true, nil, nil)
 	now := float64(receiptTestNow)
 
-	_, err := VerifyReceipt(signed.receipt, VerifyReceiptOptions{
-		Now:         &now,
-		Attestation: []byte("fake.jwt.tokenx"),
+	_, err := VerifyReceipt(signed.receipt, receiptTestIssuer, VerifyReceiptOptions{
+		Now:             &now,
+		Attestation:     []byte("fake.jwt.tokenx"),
+		RequireBindings: boolPointer(false),
 	})
 	if !receiptErrorIs[*ReceiptAttestationError](err) || !strings.Contains(err.Error(), "does not match the flattened receipt's embedded attestation") {
 		t.Fatalf("got %T (%v), want embedded-attestation mismatch", err, err)
@@ -582,7 +765,7 @@ func TestReceiptCapturePreservesExactWireBytesAndVerifies(t *testing.T) {
 		t.Fatal("capture did not discover receipt")
 	}
 	now := float64(receiptTestNow)
-	verified, err := capture.Verify(VerifyReceiptOptions{Now: &now})
+	verified, err := capture.Verify(receiptTestIssuer, VerifyReceiptOptions{RequestBody: []byte("request"), Now: &now})
 	requireNoReceiptError(t, err)
 	if verified.JTI != "chatcmpl-test" {
 		t.Fatalf("JTI = %q", verified.JTI)

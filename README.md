@@ -247,11 +247,28 @@ fetch and full verification flow.
 
 ## Receipt Verification
 
-`VerifyReceipt` verifies compact and flattened inference receipts. Flattened
-receipts embed their signing-key attestation. Compact receipts carry only an
-`att_sha256` claim, so pass the exact separately fetched document in
-`VerifyReceiptOptions.Attestation` (or explicitly set `RequireAttestation` to
-false for signature-and-hashes-only verification).
+`VerifyReceipt` pins the signed issuer and, by default, requires the exact
+request and response bytes so a valid signature cannot be mistaken for proof
+about different traffic:
+
+```go
+claims, err := trustedrouter.VerifyReceipt(
+	receiptJWS,
+	"https://api.trustedrouter.com",
+	trustedrouter.VerifyReceiptOptions{
+		RequestBody:   serializedRequest,
+		ResponseBody:  responseBytes,
+		ExpectedNonce: &requestNonce,
+	},
+)
+```
+
+Flattened receipts embed their signing-key attestation. Compact receipts carry
+only an `att_sha256` claim, so pass the exact separately fetched document in
+`VerifyReceiptOptions.Attestation`. For deliberate signature-only inspection,
+set `RequireBindings` to a pointer to `false`. If a compact receipt's pinned
+attestation document is unavailable, separately set `RequireAttestation` to a
+pointer to `false`; both escape hatches must be explicit.
 
 The `/receipt-attestation` endpoint serves the document for the instance that
 answers that fetch. When verifying a compact receipt, retry the fetch until
