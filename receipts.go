@@ -13,11 +13,13 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net/url"
 	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -94,6 +96,28 @@ func (e *ReceiptClaimsError) Unwrap() error {
 		return nil
 	}
 	return e.ReceiptVerificationError
+}
+
+// MissingBindingError reports required caller traffic that was not supplied
+// for a receipt digest binding.
+type MissingBindingError struct{ *ReceiptClaimsError }
+
+func (e *MissingBindingError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.ReceiptClaimsError
+}
+
+// ReceiptIssuerError reports an invalid receipt issuer or a mismatch with the
+// caller's pinned issuer origin.
+type ReceiptIssuerError struct{ *ReceiptClaimsError }
+
+func (e *ReceiptIssuerError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.ReceiptClaimsError
 }
 
 // ReceiptTimeError reports an invalid issue time or age bound.
@@ -186,6 +210,14 @@ func receiptClaims(message string, err error) error {
 	return &ReceiptClaimsError{receiptBase(message, err)}
 }
 
+func receiptMissingBinding(message string) error {
+	return &MissingBindingError{&ReceiptClaimsError{receiptBase(message, nil)}}
+}
+
+func receiptIssuer(message string, err error) error {
+	return &ReceiptIssuerError{&ReceiptClaimsError{receiptBase(message, err)}}
+}
+
 func receiptTime(message string, err error) error {
 	return &ReceiptTimeError{&ReceiptClaimsError{receiptBase(message, err)}}
 }
@@ -258,8 +290,9 @@ type ReceiptClaims struct {
 	Attestation string `json:"attestation"`
 }
 
-// VerifyReceiptOptions configures VerifyReceipt. Nil byte slices and nil
-// pointers mean the corresponding optional check was not requested.
+// VerifyReceiptOptions configures VerifyReceipt. RequestBody and exactly one
+// response representation are required unless RequireBindings explicitly
+// points to false. A non-nil empty byte slice is a present, empty body.
 type VerifyReceiptOptions struct {
 	RequestBody    []byte
 	ResponseBody   []byte
@@ -272,6 +305,9 @@ type VerifyReceiptOptions struct {
 	MaxAgeSeconds      *float64
 	Now                *float64
 	RequireAttestation *bool
+	// RequireBindings defaults to true. Set it to a pointer to false only for
+	// deliberate signature-only or partial-binding inspection.
+	RequireBindings *bool
 }
 
 type receiptEnvelope struct {
@@ -288,13 +324,21 @@ type receiptSSEEvent struct {
 	done    bool
 }
 
-// VerifyReceipt verifies a compact or flattened v1 inference receipt.
+// VerifyReceipt verifies a compact or flattened v1 inference receipt against
+// a required, pinned HTTPS issuer origin and the caller's exact traffic bytes.
 //
 // Compact receipts carry only an att_sha256 pin. Fetch /receipt-attestation
 // and retry when necessary until SHA-256 of the returned per-instance document
 // matches that pin, then pass its exact bytes in VerifyReceiptOptions.Attestation.
 // Flattened receipts carry the document in their protected header.
-func VerifyReceipt(receipt any, opts VerifyReceiptOptions) (*ReceiptClaims, error) {
+func VerifyReceipt(receipt any, expectedIssuer string, opts VerifyReceiptOptions) (*ReceiptClaims, error) {
+	if err := requireReceiptTrafficBindings(opts); err != nil {
+		return nil, err
+	}
+	canonicalExpectedIssuer, err := canonicalReceiptHTTPSOrigin(expectedIssuer, "expected_issuer")
+	if err != nil {
+		return nil, err
+	}
 	envelope, err := parseReceiptEnvelope(receipt)
 	if err != nil {
 		return nil, err
@@ -319,6 +363,17 @@ func VerifyReceipt(receipt any, opts VerifyReceiptOptions) (*ReceiptClaims, erro
 	rv, ok := receiptInteger(payload["rv"])
 	if !ok || rv != 1 {
 		return nil, receiptClaims(fmt.Sprintf("rv claim check failed: expected integer 1, got %s", receiptRepr(payload["rv"])), nil)
+	}
+	issuer, err := requiredReceiptString(payload, "iss", "claims")
+	if err != nil {
+		return nil, err
+	}
+	canonicalIssuer, err := canonicalReceiptHTTPSOrigin(issuer, "iss claim")
+	if err != nil {
+		return nil, err
+	}
+	if !hmac.Equal([]byte(canonicalIssuer), []byte(canonicalExpectedIssuer)) {
+		return nil, receiptIssuer(fmt.Sprintf("iss claim check failed: expected %q, got %q", canonicalExpectedIssuer, canonicalIssuer), nil)
 	}
 	iat, ok := receiptInteger(payload["iat"])
 	if !ok {
@@ -429,10 +484,6 @@ func VerifyReceipt(receipt any, opts VerifyReceiptOptions) (*ReceiptClaims, erro
 		}
 	}
 
-	issuer, err := requiredReceiptString(payload, "iss", "claims")
-	if err != nil {
-		return nil, err
-	}
 	jti, err := requiredReceiptString(payload, "jti", "claims")
 	if err != nil {
 		return nil, err
@@ -1010,6 +1061,71 @@ func optionalReceiptString(object map[string]any, name, family string) (string, 
 	return value, nil
 }
 
+func requireReceiptTrafficBindings(opts VerifyReceiptOptions) error {
+	if opts.RequireBindings != nil && !*opts.RequireBindings {
+		return nil
+	}
+	missingRequest := opts.RequestBody == nil
+	missingResponse := opts.ResponseBody == nil && opts.ResponseStream == nil
+	switch {
+	case missingRequest && missingResponse:
+		return receiptMissingBinding("receipt binding check failed: missing request_body and response_body or response_stream")
+	case missingRequest:
+		return receiptMissingBinding("receipt binding check failed: missing request_body")
+	case missingResponse:
+		return receiptMissingBinding("receipt binding check failed: missing response_body or response_stream")
+	default:
+		return nil
+	}
+}
+
+func canonicalReceiptHTTPSOrigin(value, check string) (string, error) {
+	if value == "" {
+		return "", receiptIssuer(check+" check failed: required HTTPS origin is missing", nil)
+	}
+	parsed, err := url.Parse(value)
+	if err != nil {
+		return "", receiptIssuer(check+" check failed: invalid HTTPS origin", err)
+	}
+	if !strings.EqualFold(parsed.Scheme, "https") {
+		return "", receiptIssuer(check+" check failed: issuer origin must use https", nil)
+	}
+	if parsed.Opaque != "" || parsed.Host == "" || parsed.User != nil || (parsed.Path != "" && parsed.Path != "/") || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || parsed.RawFragment != "" {
+		return "", receiptIssuer(check+" check failed: expected an origin with no path, query, or fragment", nil)
+	}
+	host := strings.ToLower(parsed.Hostname())
+	if host == "" || strings.IndexFunc(host, unicode.IsSpace) >= 0 {
+		return "", receiptIssuer(check+" check failed: invalid HTTPS origin host", nil)
+	}
+	port := parsed.Port()
+	if port != "" {
+		portNumber, parseErr := strconv.ParseUint(port, 10, 16)
+		if parseErr != nil || portNumber > 65535 {
+			return "", receiptIssuer(check+" check failed: invalid HTTPS origin", parseErr)
+		}
+	}
+	if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+	canonical := "https://" + host
+	if port != "" && port != "443" {
+		canonical += ":" + port
+	}
+
+	// Restrict accepted spelling to case differences, one trailing slash, and
+	// an explicit default HTTPS port. This rejects URL parser normalizations
+	// such as escaped hosts while still canonicalizing :443 away.
+	normalizedInput := strings.ToLower(strings.TrimSuffix(value, "/"))
+	validInput := normalizedInput == canonical
+	if port == "443" {
+		validInput = normalizedInput == canonical+":443"
+	}
+	if !validInput {
+		return "", receiptIssuer(check+" check failed: invalid HTTPS origin", nil)
+	}
+	return canonical, nil
+}
+
 func receiptInteger(value any) (int64, bool) {
 	number, ok := value.(json.Number)
 	if !ok {
@@ -1084,8 +1200,9 @@ func (c *ReceiptCapture) Receipt() map[string]any {
 	return c.receipt
 }
 
-// Verify verifies the discovered receipt against all exact bytes captured so far.
-func (c *ReceiptCapture) Verify(opts VerifyReceiptOptions) (*ReceiptClaims, error) {
+// Verify verifies the discovered receipt against a pinned issuer and all exact
+// bytes captured so far.
+func (c *ReceiptCapture) Verify(expectedIssuer string, opts VerifyReceiptOptions) (*ReceiptClaims, error) {
 	if c == nil {
 		return nil, receiptStructure("receipt capture check failed: no flattened receipt event has been captured", nil)
 	}
@@ -1099,7 +1216,7 @@ func (c *ReceiptCapture) Verify(opts VerifyReceiptOptions) (*ReceiptClaims, erro
 		return nil, receiptHash("ReceiptCapture.Verify supplies ResponseStream from captured bytes", nil)
 	}
 	opts.ResponseStream = c.CapturedBytes()
-	return VerifyReceipt(c.receipt, opts)
+	return VerifyReceipt(c.receipt, expectedIssuer, opts)
 }
 
 func (c *ReceiptCapture) refreshReceipt() {
