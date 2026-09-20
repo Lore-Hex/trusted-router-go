@@ -40,10 +40,13 @@ var receiptNoncePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,88}$`)
 // ReceiptVerificationError is the common base for every fail-closed receipt
 // verification error.
 type ReceiptVerificationError struct {
+	// Message is the human-readable verification failure.
 	Message string
-	Err     error
+	// Err is the underlying cause of the failure.
+	Err error
 }
 
+// Error returns the verification failure message.
 func (e *ReceiptVerificationError) Error() string {
 	if e == nil {
 		return ""
@@ -51,6 +54,7 @@ func (e *ReceiptVerificationError) Error() string {
 	return e.Message
 }
 
+// Unwrap returns the underlying error for errors.Is and errors.As.
 func (e *ReceiptVerificationError) Unwrap() error {
 	if e == nil {
 		return nil
@@ -61,6 +65,7 @@ func (e *ReceiptVerificationError) Unwrap() error {
 // ReceiptStructureError reports a malformed compact or flattened JWS.
 type ReceiptStructureError struct{ *ReceiptVerificationError }
 
+// Unwrap returns the underlying error for errors.Is and errors.As.
 func (e *ReceiptStructureError) Unwrap() error {
 	if e == nil {
 		return nil
@@ -71,6 +76,7 @@ func (e *ReceiptStructureError) Unwrap() error {
 // ReceiptHeaderError reports an invalid or unsupported protected JWS header.
 type ReceiptHeaderError struct{ *ReceiptVerificationError }
 
+// Unwrap returns the underlying error for errors.Is and errors.As.
 func (e *ReceiptHeaderError) Unwrap() error {
 	if e == nil {
 		return nil
@@ -81,6 +87,7 @@ func (e *ReceiptHeaderError) Unwrap() error {
 // ReceiptSignatureError reports a failed Ed25519 signature check.
 type ReceiptSignatureError struct{ *ReceiptVerificationError }
 
+// Unwrap returns the underlying error for errors.Is and errors.As.
 func (e *ReceiptSignatureError) Unwrap() error {
 	if e == nil {
 		return nil
@@ -91,6 +98,7 @@ func (e *ReceiptSignatureError) Unwrap() error {
 // ReceiptClaimsError reports missing, malformed, or unsupported claims.
 type ReceiptClaimsError struct{ *ReceiptVerificationError }
 
+// Unwrap returns the underlying error for errors.Is and errors.As.
 func (e *ReceiptClaimsError) Unwrap() error {
 	if e == nil {
 		return nil
@@ -102,6 +110,7 @@ func (e *ReceiptClaimsError) Unwrap() error {
 // for a receipt digest binding.
 type MissingBindingError struct{ *ReceiptClaimsError }
 
+// Unwrap returns the underlying error for errors.Is and errors.As.
 func (e *MissingBindingError) Unwrap() error {
 	if e == nil {
 		return nil
@@ -113,6 +122,7 @@ func (e *MissingBindingError) Unwrap() error {
 // caller's pinned issuer origin.
 type ReceiptIssuerError struct{ *ReceiptClaimsError }
 
+// Unwrap returns the underlying error for errors.Is and errors.As.
 func (e *ReceiptIssuerError) Unwrap() error {
 	if e == nil {
 		return nil
@@ -123,6 +133,7 @@ func (e *ReceiptIssuerError) Unwrap() error {
 // ReceiptTimeError reports an invalid issue time or age bound.
 type ReceiptTimeError struct{ *ReceiptClaimsError }
 
+// Unwrap returns the underlying error for errors.Is and errors.As.
 func (e *ReceiptTimeError) Unwrap() error {
 	if e == nil {
 		return nil
@@ -133,6 +144,7 @@ func (e *ReceiptTimeError) Unwrap() error {
 // ReceiptNonceError reports an invalid or mismatched nonce.
 type ReceiptNonceError struct{ *ReceiptClaimsError }
 
+// Unwrap returns the underlying error for errors.Is and errors.As.
 func (e *ReceiptNonceError) Unwrap() error {
 	if e == nil {
 		return nil
@@ -143,6 +155,7 @@ func (e *ReceiptNonceError) Unwrap() error {
 // ReceiptUpstreamError reports an invalid upstream tier or verification window.
 type ReceiptUpstreamError struct{ *ReceiptClaimsError }
 
+// Unwrap returns the underlying error for errors.Is and errors.As.
 func (e *ReceiptUpstreamError) Unwrap() error {
 	if e == nil {
 		return nil
@@ -153,6 +166,7 @@ func (e *ReceiptUpstreamError) Unwrap() error {
 // ReceiptHashError reports an invalid hash claim or exact-byte digest mismatch.
 type ReceiptHashError struct{ *ReceiptVerificationError }
 
+// Unwrap returns the underlying error for errors.Is and errors.As.
 func (e *ReceiptHashError) Unwrap() error {
 	if e == nil {
 		return nil
@@ -163,6 +177,7 @@ func (e *ReceiptHashError) Unwrap() error {
 // ReceiptAttestationError reports invalid signing-key attestation evidence.
 type ReceiptAttestationError struct{ *ReceiptVerificationError }
 
+// Unwrap returns the underlying error for errors.Is and errors.As.
 func (e *ReceiptAttestationError) Unwrap() error {
 	if e == nil {
 		return nil
@@ -173,6 +188,7 @@ func (e *ReceiptAttestationError) Unwrap() error {
 // MissingAttestationError reports required attestation evidence that is absent.
 type MissingAttestationError struct{ *ReceiptAttestationError }
 
+// Unwrap returns the underlying error for errors.Is and errors.As.
 func (e *MissingAttestationError) Unwrap() error {
 	if e == nil {
 		return nil
@@ -183,6 +199,7 @@ func (e *MissingAttestationError) Unwrap() error {
 // UnsupportedAttestationError reports an attestation kind this SDK cannot chain.
 type UnsupportedAttestationError struct{ *ReceiptAttestationError }
 
+// Unwrap returns the underlying error for errors.Is and errors.As.
 func (e *UnsupportedAttestationError) Unwrap() error {
 	if e == nil {
 		return nil
@@ -248,44 +265,70 @@ func receiptUnsupportedAttestation(message string) error {
 
 // ReceiptHashClaims describes one exact-byte SHA-256 hash domain.
 type ReceiptHashClaims struct {
-	Alg    string `json:"alg"`
-	Hash   string `json:"hash"`
-	Of     string `json:"of"`
+	// Alg identifies the hash algorithm.
+	Alg string `json:"alg"`
+	// Hash is the encoded digest of the exact bound bytes.
+	Hash string `json:"hash"`
+	// Of identifies the byte domain covered by the hash.
+	Of string `json:"of"`
+	// Events is the bound stream event count when supplied.
 	Events *int64 `json:"events,omitempty"`
 }
 
 // ReceiptModelClaims records the router's exact model selection metadata.
 type ReceiptModelClaims struct {
+	// Requested is the model requested by the caller.
 	Requested string `json:"requested"`
-	Selected  string `json:"selected"`
-	Provider  string `json:"provider"`
-	Endpoint  string `json:"endpoint"`
+	// Selected is the model selected by the router.
+	Selected string `json:"selected"`
+	// Provider identifies the selected upstream provider.
+	Provider string `json:"provider"`
+	// Endpoint identifies the selected upstream endpoint.
+	Endpoint string `json:"endpoint"`
 }
 
 // ReceiptUpstreamClaims records how the serving enclave verified its upstream.
 type ReceiptUpstreamClaims struct {
-	Tier                  string `json:"tier"`
-	Policy                string `json:"policy,omitempty"`
-	VerifiedAt            *int64 `json:"verified_at,omitempty"`
+	// Tier is the upstream verification tier.
+	Tier string `json:"tier"`
+	// Policy identifies the upstream verification policy.
+	Policy string `json:"policy,omitempty"`
+	// VerifiedAt is the upstream verification Unix timestamp when supplied.
+	VerifiedAt *int64 `json:"verified_at,omitempty"`
+	// VerificationExpiresAt is the upstream verification expiration Unix timestamp when supplied.
 	VerificationExpiresAt *int64 `json:"verification_expires_at,omitempty"`
-	CertSHA256            string `json:"cert_sha256,omitempty"`
+	// CertSHA256 is the upstream certificate SHA-256 fingerprint.
+	CertSHA256 string `json:"cert_sha256,omitempty"`
 }
 
 // ReceiptClaims is the verified v1 receipt payload plus attestation status.
 type ReceiptClaims struct {
-	RV                int64                 `json:"rv"`
-	Issuer            string                `json:"iss"`
-	IssuedAt          int64                 `json:"iat"`
-	JTI               string                `json:"jti"`
-	GenerationID      string                `json:"gen,omitempty"`
-	Nonce             string                `json:"nonce,omitempty"`
-	Route             string                `json:"route"`
-	Request           ReceiptHashClaims     `json:"req"`
-	Response          ReceiptHashClaims     `json:"resp"`
-	Model             ReceiptModelClaims    `json:"model"`
-	Upstream          ReceiptUpstreamClaims `json:"upstream"`
-	AttestationSHA256 string                `json:"att_sha256,omitempty"`
-	AttestationStatus string                `json:"attestation_status"`
+	// RV is the receipt format version.
+	RV int64 `json:"rv"`
+	// Issuer is the signed issuer origin.
+	Issuer string `json:"iss"`
+	// IssuedAt is the receipt issuance Unix timestamp.
+	IssuedAt int64 `json:"iat"`
+	// JTI is the unique receipt identifier.
+	JTI string `json:"jti"`
+	// GenerationID identifies the inference generation when supplied.
+	GenerationID string `json:"gen,omitempty"`
+	// Nonce is the caller nonce bound into the receipt.
+	Nonce string `json:"nonce,omitempty"`
+	// Route identifies the signed inference route.
+	Route string `json:"route"`
+	// Request describes the exact request-byte hash binding.
+	Request ReceiptHashClaims `json:"req"`
+	// Response describes the response-byte or stream hash binding.
+	Response ReceiptHashClaims `json:"resp"`
+	// Model records the requested and selected model identities.
+	Model ReceiptModelClaims `json:"model"`
+	// Upstream records the serving enclave upstream verification.
+	Upstream ReceiptUpstreamClaims `json:"upstream"`
+	// AttestationSHA256 pins the exact separately supplied attestation bytes.
+	AttestationSHA256 string `json:"att_sha256,omitempty"`
+	// AttestationStatus reports whether signing-key attestation was verified.
+	AttestationStatus string `json:"attestation_status"`
 	// Attestation is an alias for AttestationStatus, matching the other SDKs.
 	Attestation string `json:"attestation"`
 }
@@ -294,16 +337,23 @@ type ReceiptClaims struct {
 // response representation are required unless RequireBindings explicitly
 // points to false. A non-nil empty byte slice is a present, empty body.
 type VerifyReceiptOptions struct {
-	RequestBody    []byte
-	ResponseBody   []byte
+	// RequestBody supplies the exact serialized request bytes; nil means absent.
+	RequestBody []byte
+	// ResponseBody supplies the exact non-streaming response bytes; nil means absent.
+	ResponseBody []byte
+	// ResponseStream supplies the exact SSE response bytes; nil means absent.
 	ResponseStream []byte
 	// Attestation supplies the exact GCP attestation-document bytes pinned by a
 	// compact receipt's att_sha256 claim. For a flattened receipt, supplied
 	// bytes must exactly match the document embedded in its protected header.
-	Attestation        []byte
-	ExpectedNonce      *string
-	MaxAgeSeconds      *float64
-	Now                *float64
+	Attestation []byte
+	// ExpectedNonce pins the caller nonce when non-nil.
+	ExpectedNonce *string
+	// MaxAgeSeconds limits receipt age in seconds when non-nil.
+	MaxAgeSeconds *float64
+	// Now overrides the current Unix time in seconds for verification.
+	Now *float64
+	// RequireAttestation defaults to true; false explicitly permits unavailable compact-receipt attestation.
 	RequireAttestation *bool
 	// RequireBindings defaults to true. Set it to a pointer to false only for
 	// deliberate signature-only or partial-binding inspection.

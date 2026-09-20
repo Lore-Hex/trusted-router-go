@@ -37,3 +37,6 @@ jobs:
 
       - name: mutation and static negative checks
         run: go run ./scripts/mutation-check
+
+      - name: consumer and CLI negative checks
+        run: python3 scripts/dx-mutation-check.py

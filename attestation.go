@@ -131,9 +131,12 @@ func (g GatewayAttestation) AsMap() map[string]any {
 
 // TrustReleaseTLS contains TLS metadata from the public trust release.
 type TrustReleaseTLS struct {
-	Mode     string         `json:"mode,omitempty"`
-	Hostname string         `json:"hostname,omitempty"`
-	Extra    map[string]any `json:"-"`
+	// Mode is the advertised TLS mode.
+	Mode string `json:"mode,omitempty"`
+	// Hostname is the gateway TLS hostname.
+	Hostname string `json:"hostname,omitempty"`
+	// Extra preserves response fields not represented by this type.
+	Extra map[string]any `json:"-"`
 }
 
 // UnmarshalJSON decodes TLS metadata and preserves unknown fields in Extra.
@@ -150,9 +153,12 @@ func (t *TrustReleaseTLS) UnmarshalJSON(data []byte) error {
 
 // TrustReleaseDataPolicy contains prompt/data handling commitments from the trust release.
 type TrustReleaseDataPolicy struct {
-	PromptOutputStorage      bool           `json:"prompt_output_storage"`
-	ControlPlanePromptAccess bool           `json:"control_plane_prompt_access"`
-	Extra                    map[string]any `json:"-"`
+	// PromptOutputStorage describes the advertised prompt and output storage policy.
+	PromptOutputStorage bool `json:"prompt_output_storage"`
+	// ControlPlanePromptAccess describes control-plane access to prompts.
+	ControlPlanePromptAccess bool `json:"control_plane_prompt_access"`
+	// Extra preserves response fields not represented by this type.
+	Extra map[string]any `json:"-"`
 }
 
 // UnmarshalJSON decodes data-policy metadata and preserves unknown fields in Extra.
@@ -169,20 +175,34 @@ func (p *TrustReleaseDataPolicy) UnmarshalJSON(data []byte) error {
 
 // TrustRelease is the parsed public TrustedRouter trust-release document.
 type TrustRelease struct {
-	Platform                string                  `json:"platform,omitempty"`
-	SourceRepo              string                  `json:"source_repo,omitempty"`
-	SourceRepositories      map[string]string       `json:"source_repositories,omitempty"`
-	SourceCommit            string                  `json:"source_commit,omitempty"`
-	ImageReference          string                  `json:"image_reference,omitempty"`
-	AcceptedImageReferences []string                `json:"accepted_image_references,omitempty"`
-	ImageDigest             string                  `json:"image_digest,omitempty"`
-	AcceptedImageDigests    []string                `json:"accepted_image_digests,omitempty"`
-	AttestationIssuer       string                  `json:"attestation_issuer,omitempty"`
-	AttestationAudience     string                  `json:"attestation_audience,omitempty"`
-	APIBaseURL              string                  `json:"api_base_url,omitempty"`
-	TLS                     *TrustReleaseTLS        `json:"tls,omitempty"`
-	DataPolicy              *TrustReleaseDataPolicy `json:"data_policy,omitempty"`
-	Extra                   map[string]any          `json:"-"`
+	// Platform identifies the confidential-computing platform.
+	Platform string `json:"platform,omitempty"`
+	// SourceRepo is the primary source repository URL.
+	SourceRepo string `json:"source_repo,omitempty"`
+	// SourceRepositories lists the source repositories used by the release.
+	SourceRepositories map[string]string `json:"source_repositories,omitempty"`
+	// SourceCommit identifies the source revision used to build the release.
+	SourceCommit string `json:"source_commit,omitempty"`
+	// ImageReference is the published container image reference.
+	ImageReference string `json:"image_reference,omitempty"`
+	// AcceptedImageReferences lists container references accepted during a rollout.
+	AcceptedImageReferences []string `json:"accepted_image_references,omitempty"`
+	// ImageDigest is the published container image digest.
+	ImageDigest string `json:"image_digest,omitempty"`
+	// AcceptedImageDigests lists container digests accepted during a rollout.
+	AcceptedImageDigests []string `json:"accepted_image_digests,omitempty"`
+	// AttestationIssuer is the expected attestation JWT issuer.
+	AttestationIssuer string `json:"attestation_issuer,omitempty"`
+	// AttestationAudience is the expected attestation JWT audience.
+	AttestationAudience string `json:"attestation_audience,omitempty"`
+	// APIBaseURL is the inference API base URL advertised by the release.
+	APIBaseURL string `json:"api_base_url,omitempty"`
+	// TLS describes the release TLS configuration.
+	TLS *TrustReleaseTLS `json:"tls,omitempty"`
+	// DataPolicy describes the release data-handling policy.
+	DataPolicy *TrustReleaseDataPolicy `json:"data_policy,omitempty"`
+	// Extra preserves response fields not represented by this type.
+	Extra map[string]any `json:"-"`
 }
 
 // UnmarshalJSON decodes a trust release and preserves unknown fields in Extra.

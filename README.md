@@ -9,6 +9,14 @@ The package also exposes the same stable routing/privacy aliases and five
 atomic orchestration builders as the other official SDKs: Synth, Advisor,
 Selector, MapReduce, and Subagent.
 
+Requires Go 1.23 or later. No runtime dependencies.
+
+- Repository: https://github.com/Lore-Hex/trusted-router-go
+- Homepage: https://trustedrouter.com
+- Documentation: https://pkg.go.dev/github.com/Lore-Hex/trusted-router-go
+- License: Apache-2.0
+- Topics: Go, TrustedRouter, OpenAI, Anthropic, LLM, privacy, attestation
+
 ## Install
 
 ```sh
@@ -57,10 +65,11 @@ preferences and remain hard constraints even when a model is explicit. Use
 `EUModel` for the EU-focused routing pool:
 
 ```go
+provider := trustedrouter.ConfidentialProvider()
 request := trustedrouter.ChatRequest{
 	Model:    "z-ai/glm-5.2",
 	Messages: []map[string]any{{"role": "user", "content": "Review this contract."}},
-	Provider: trustedrouter.ConfidentialProvider(),
+	Provider: &provider,
 }
 ```
 
@@ -277,7 +286,10 @@ pass those unchanged bytes to `VerifyReceipt`.
 
 ## CLI
 
+Install the binary and run commands:
+
 ```sh
+go install github.com/Lore-Hex/trusted-router-go/cmd/trustedrouter@latest
 TRUSTEDROUTER_API_KEY=sk-tr-v1-... trustedrouter chat "hello"
 trustedrouter --control-base-url https://trustedrouter.com/v1 providers
 trustedrouter trust
@@ -288,7 +300,7 @@ trustedrouter attest --verify
 
 ## Parity
 
-See [PARITY.md](./PARITY.md) for symbol-by-symbol parity with the sibling SDKs:
+See [PARITY.md](https://github.com/Lore-Hex/trusted-router-go/blob/main/PARITY.md) for symbol-by-symbol parity with the sibling SDKs:
 
 - `trusted-router-py`
 - `trusted-router-js`

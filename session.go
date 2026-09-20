@@ -42,6 +42,7 @@ type VerifyGatewaySessionOptions struct {
 
 // GatewaySession is a verified, pinned gateway TLS session.
 type GatewaySession struct {
+	// Attestation contains the verified claims bound to this live TLS session.
 	Attestation *GatewayAttestation
 	// Conn is the live TLS connection whose exporter was committed by Attestation.
 	// The caller owns and must close it. Use Reader for reads; it may already
