@@ -25,16 +25,26 @@ type OAuthPkcePair struct {
 
 // OAuthAuthorizeURLOptions configures an OAuth authorize URL.
 type OAuthAuthorizeURLOptions struct {
-	CallbackURL         string
-	CodeChallenge       string
+	// CallbackURL is the browser redirect URL for the OAuth callback.
+	CallbackURL string
+	// CodeChallenge is the PKCE challenge sent to the authorization endpoint.
+	CodeChallenge string
+	// CodeChallengeMethod selects the PKCE challenge method; generated pairs use S256.
 	CodeChallengeMethod string
-	KeyLabel            string
-	Limit               any
-	UsageLimitType      string
-	ExpiresAt           string
-	SpawnAgent          string
-	SpawnCloud          string
-	State               string
+	// KeyLabel labels the delegated API key.
+	KeyLabel string
+	// Limit sets the delegated key usage limit.
+	Limit any
+	// UsageLimitType selects the usage-limit accounting period.
+	UsageLimitType string
+	// ExpiresAt sets the delegated key expiration.
+	ExpiresAt string
+	// SpawnAgent selects the agent to launch after authorization.
+	SpawnAgent string
+	// SpawnCloud selects the cloud environment to launch after authorization.
+	SpawnCloud string
+	// State is the CSRF value round-tripped through the OAuth callback.
+	State string
 }
 
 // OAuthAuthorizeUrlOptions is an alias for callers using the TypeScript-style name.
@@ -42,15 +52,24 @@ type OAuthAuthorizeUrlOptions = OAuthAuthorizeURLOptions
 
 // CreateOAuthAuthorizationOptions configures CreateOAuthAuthorization.
 type CreateOAuthAuthorizationOptions struct {
-	CallbackURL    string
-	CodeVerifier   string
-	KeyLabel       string
-	Limit          any
+	// CallbackURL is the browser redirect URL for the OAuth callback.
+	CallbackURL string
+	// CodeVerifier is the PKCE verifier corresponding to the authorization challenge.
+	CodeVerifier string
+	// KeyLabel labels the delegated API key.
+	KeyLabel string
+	// Limit sets the delegated key usage limit.
+	Limit any
+	// UsageLimitType selects the usage-limit accounting period.
 	UsageLimitType string
-	ExpiresAt      string
-	SpawnAgent     string
-	SpawnCloud     string
-	State          string
+	// ExpiresAt sets the delegated key expiration.
+	ExpiresAt string
+	// SpawnAgent selects the agent to launch after authorization.
+	SpawnAgent string
+	// SpawnCloud selects the cloud environment to launch after authorization.
+	SpawnCloud string
+	// State is the CSRF value round-tripped through the OAuth callback.
+	State string
 }
 
 // OAuthAuthorization contains all values needed to start and later finish the OAuth flow.
@@ -64,10 +83,14 @@ type OAuthAuthorization struct {
 
 // OAuthKeyExchangeRequest configures an OAuth key exchange.
 type OAuthKeyExchangeRequest struct {
-	Code                string
-	CodeVerifier        string
+	// Code is the authorization code returned by the OAuth callback.
+	Code string
+	// CodeVerifier is the PKCE verifier corresponding to the authorization challenge.
+	CodeVerifier string
+	// CodeChallengeMethod selects the PKCE challenge method; generated pairs use S256.
 	CodeChallengeMethod string
-	Timeout             *time.Duration
+	// Timeout overrides the exchange request timeout when non-nil.
+	Timeout *time.Duration
 }
 
 // OAuthKeyExchangeResponse is the response returned by POST /auth/keys.
@@ -101,11 +124,16 @@ func (o *OAuthKeyExchangeResponse) UnmarshalJSON(data []byte) error {
 
 // OAuthIdentity is the verified identity returned by OAuth endpoints.
 type OAuthIdentity struct {
-	Sub           string         `json:"sub"`
-	Email         *string        `json:"email,omitempty"`
-	EmailVerified *bool          `json:"email_verified,omitempty"`
-	WalletAddress *string        `json:"wallet_address,omitempty"`
-	Extra         map[string]any `json:"-"`
+	// Sub is the identity subject identifier.
+	Sub string `json:"sub"`
+	// Email is the email address when supplied.
+	Email *string `json:"email,omitempty"`
+	// EmailVerified reports whether the email was verified when supplied.
+	EmailVerified *bool `json:"email_verified,omitempty"`
+	// WalletAddress is the linked wallet address when supplied.
+	WalletAddress *string `json:"wallet_address,omitempty"`
+	// Extra preserves response fields not represented by this type.
+	Extra map[string]any `json:"-"`
 }
 
 // UnmarshalJSON decodes an OAuth identity and preserves unknown fields in Extra.

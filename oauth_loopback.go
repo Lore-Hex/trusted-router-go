@@ -50,7 +50,9 @@ type OAuthLoopbackOptions struct {
 
 // OAuthLoopbackResult is the captured OAuth callback.
 type OAuthLoopbackResult struct {
-	Code  string
+	// Code is the authorization code returned by the OAuth callback.
+	Code string
+	// State is the CSRF value round-tripped through the OAuth callback.
 	State string
 }
 

@@ -103,10 +103,15 @@ func AdvisorTool(opts AdvisorToolOptions) map[string]any {
 
 // SelectorToolOptions configures a trustedrouter:selector tool.
 type SelectorToolOptions struct {
-	Enabled             *bool
-	AnalysisModels      []string
-	SelectorModels      []string
-	SelectorPrompt      *string
+	// Enabled overrides whether the orchestration tool is enabled when non-nil.
+	Enabled *bool
+	// AnalysisModels selects models that analyze the request.
+	AnalysisModels []string
+	// SelectorModels selects models that choose among candidate answers.
+	SelectorModels []string
+	// SelectorPrompt overrides the selector instructions.
+	SelectorPrompt *string
+	// MaxCompletionTokens limits generated completion tokens when non-nil.
 	MaxCompletionTokens *int
 }
 
@@ -123,14 +128,23 @@ func SelectorTool(opts SelectorToolOptions) map[string]any {
 
 // MapReduceToolOptions configures a trustedrouter:mapreduce tool.
 type MapReduceToolOptions struct {
-	Enabled             *bool
-	MapperModels        []string
-	ParallelModels      []string
-	ReducerModels       []string
-	MaxParts            *int
-	MapperPrompt        *string
-	ParallelPrompt      *string
-	ReducerPrompt       *string
+	// Enabled overrides whether the orchestration tool is enabled when non-nil.
+	Enabled *bool
+	// MapperModels selects models for map tasks.
+	MapperModels []string
+	// ParallelModels selects models for parallel tasks.
+	ParallelModels []string
+	// ReducerModels selects models that combine task results.
+	ReducerModels []string
+	// MaxParts limits the number of map partitions when non-nil.
+	MaxParts *int
+	// MapperPrompt overrides mapper instructions.
+	MapperPrompt *string
+	// ParallelPrompt overrides parallel-task instructions.
+	ParallelPrompt *string
+	// ReducerPrompt overrides reducer instructions.
+	ReducerPrompt *string
+	// MaxCompletionTokens limits generated completion tokens when non-nil.
 	MaxCompletionTokens *int
 }
 
@@ -151,16 +165,26 @@ func MapReduceTool(opts MapReduceToolOptions) map[string]any {
 
 // SubagentToolOptions configures a trustedrouter:subagent tool.
 type SubagentToolOptions struct {
-	Enabled             *bool
-	ControllerModel     *string
-	Model               *string
-	Instructions        *string
-	Depth               *int
-	MaxSubagentCalls    *int
+	// Enabled overrides whether the orchestration tool is enabled when non-nil.
+	Enabled *bool
+	// ControllerModel selects the model coordinating subagents.
+	ControllerModel *string
+	// Model selects the model used by the orchestration tool.
+	Model *string
+	// Instructions supplies additional orchestration instructions.
+	Instructions *string
+	// Depth limits subagent nesting when non-nil.
+	Depth *int
+	// MaxSubagentCalls limits subagent calls when non-nil.
+	MaxSubagentCalls *int
+	// MaxCompletionTokens limits generated completion tokens when non-nil.
 	MaxCompletionTokens *int
-	Temperature         *float64
-	Reasoning           any
-	Tools               []map[string]any
+	// Temperature overrides sampling temperature when non-nil.
+	Temperature *float64
+	// Reasoning supplies model-specific reasoning options.
+	Reasoning any
+	// Tools supplies tools available to the subagent.
+	Tools []map[string]any
 }
 
 // SubagentTool builds a trustedrouter:subagent tool spec.
