@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.5.0 — 2026-09-20
+
+- Offline signed inference receipt verification: `VerifyReceipt` accepts a
+  compact or flattened JWS and fails closed with typed errors — structure
+  (duplicate JSON members rejected at the token level), header, Ed25519
+  signature via `crypto/ed25519` (no new dependencies), `rv`/`iat`, nonce,
+  tee-verified claims, and both captured-stream hash domains.
+  `ReceiptCapture` preserves exact wire bytes from a streaming response. GCP
+  attestation chains verify through the existing verifier with the
+  receipt-key commitment checked by set membership; other kinds return a
+  typed unsupported error rather than skipping. The enclave-generated parity
+  fixtures are byte-identical across all six SDKs.
+- Receipt-key attestation binding mode: compact receipts verify fully when
+  the caller supplies the attestation document pinned by `att_sha256` (the
+  `Attestation` option); the live-gateway path is unchanged.
+- **Receipt verification fails closed by default**: request and response
+  bindings are required unless explicitly disabled, the issuer must be pinned
+  to a canonical HTTPS origin, and the receipt's `iss` is never followed.
+- Boundary audit: unchecked type assertions and nil dereferences on decoded
+  JSON now return a typed `ResponseShapeError` instead of panicking. The
+  `/auth/keys` exchange requires only `key` and passes unknown fields
+  through; `/auth/userinfo` accepts the legacy null subject, so
+  `UserInfoData.Sub` is now `*string`. Header handling goes through
+  `net/http.Header` canonical access with repeated values preserved.
+- Consumer DX: the module ZIP drops development files (87 → 33 files) with a
+  listing gate; every exported symbol is documented; all README examples
+  compile as `Example*` tests (one pointer example was wrong and is fixed);
+  the `trustedrouter` CLI is covered by 42 cases.
+- Internal: golangci-lint v2 (errcheck, staticcheck, forcetypeassert,
+  errorlint, bodyclose, noctx, nilerr, unconvert, gosec), a shared cross-SDK
+  auth wire fixture, and a fails-without-fix mutation gate in CI.
+
 ## 0.4.0 — 2026-08-22
 
 - Added the `/v1/client-events` beacon channel (client telemetry contract v1
