@@ -96,7 +96,7 @@ func TestReleaseArtifact(t *testing.T) {
 	sort.Strings(files)
 	var archive bytes.Buffer
 	zw := zip.NewWriter(&archive)
-	prefix := modulePath + "@v0.4.0/"
+	prefix := modulePath + "@v0.5.0/"
 	for _, name := range files {
 		w, err := zw.Create(prefix + name)
 		if err != nil {
@@ -243,7 +243,7 @@ func artifactForConsumer(t *testing.T) string {
 func consumerModule(t *testing.T, artifact string) string {
 	t.Helper()
 	dir := t.TempDir()
-	dxWrite(t, filepath.Join(dir, "go.mod"), []byte("module consumer.example/smoke\n\ngo 1.23\n\nrequire "+modulePath+" v0.4.0\nreplace "+modulePath+" => "+artifact+"\n"))
+	dxWrite(t, filepath.Join(dir, "go.mod"), []byte("module consumer.example/smoke\n\ngo 1.23\n\nrequire "+modulePath+" v0.5.0\nreplace "+modulePath+" => "+artifact+"\n"))
 	return dir
 }
 
@@ -269,10 +269,10 @@ func downloadArtifact(t *testing.T, artifact string) string {
 	t.Helper()
 	proxy := t.TempDir()
 	versionDir := filepath.Join(proxy, "github.com/!lore-!hex/trusted-router-go/@v")
-	dxWrite(t, filepath.Join(versionDir, "v0.4.0.zip"), dxRead(t, filepath.Join(filepath.Dir(artifact), "module.zip")))
-	dxWrite(t, filepath.Join(versionDir, "v0.4.0.mod"), dxRead(t, filepath.Join(artifact, "go.mod")))
-	dxWrite(t, filepath.Join(versionDir, "v0.4.0.info"), []byte(`{"Version":"v0.4.0","Time":"2026-01-01T00:00:00Z"}`))
-	cmd := exec.Command("go", "mod", "download", "-json", modulePath+"@v0.4.0")
+	dxWrite(t, filepath.Join(versionDir, "v0.5.0.zip"), dxRead(t, filepath.Join(filepath.Dir(artifact), "module.zip")))
+	dxWrite(t, filepath.Join(versionDir, "v0.5.0.mod"), dxRead(t, filepath.Join(artifact, "go.mod")))
+	dxWrite(t, filepath.Join(versionDir, "v0.5.0.info"), []byte(`{"Version":"v0.5.0","Time":"2026-01-01T00:00:00Z"}`))
+	cmd := exec.Command("go", "mod", "download", "-json", modulePath+"@v0.5.0")
 	cmd.Dir = t.TempDir()
 	cmd.Env = append(os.Environ(), "GOWORK=off", "GOPROXY=file://"+filepath.ToSlash(proxy), "GOSUMDB=off", "GOMODCACHE="+t.TempDir(), "GOFLAGS=-modcacherw")
 	out, err := cmd.CombinedOutput()
