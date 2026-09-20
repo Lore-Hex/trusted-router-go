@@ -77,10 +77,13 @@ type UserInfoResponse struct {
 
 // UnmarshalJSON decodes a userinfo response and preserves unknown fields in Extra.
 func (u *UserInfoResponse) UnmarshalJSON(data []byte) error {
+	if err := requireJSONField(data, "data", '{'); err != nil {
+		return err
+	}
 	type alias UserInfoResponse
 	var out alias
 	if err := json.Unmarshal(data, &out); err != nil {
-		return err
+		return &ResponseShapeError{Err: err}
 	}
 	*u = UserInfoResponse(out)
 	u.Extra = extraFields(data, "data")
@@ -89,8 +92,8 @@ func (u *UserInfoResponse) UnmarshalJSON(data []byte) error {
 
 // UserInfoData is the data payload returned by GET /auth/userinfo.
 type UserInfoData struct {
-	// Sub is the OIDC subject.
-	Sub string `json:"sub"`
+	// Sub is the OIDC subject, or nil for a legacy ownerless key.
+	Sub *string `json:"sub"`
 	// Email is the user's email, when present.
 	Email *string `json:"email,omitempty"`
 	// EmailVerified indicates whether the email is verified.
@@ -209,7 +212,7 @@ func (c *Client) Status(ctx context.Context, statusURL string) (map[string]any, 
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // Close is best-effort cleanup; preserve the completed operation result.
 	var out map[string]any
 	if err := decodeResponse(ctx, resp, &out); err != nil {
 		return nil, err

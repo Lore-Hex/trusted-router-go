@@ -661,3 +661,12 @@ func (r *timedStreamReadCloser) Read(p []byte) (int, error) {
 }
 
 func (r *timedStreamReadCloser) Close() error { return nil }
+
+func TestToolCallIndexOverflow(t *testing.T) {
+	if got := toolCallIndex(map[string]any{"index": json.Number("9223372036854775808")}); got != 0 {
+		t.Fatalf("overflow index = %d", got)
+	}
+	if got := toolCallIndex(map[string]any{"index": json.Number("42")}); got != 42 {
+		t.Fatalf("valid index = %d", got)
+	}
+}

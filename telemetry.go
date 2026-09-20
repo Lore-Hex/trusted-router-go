@@ -326,7 +326,7 @@ func telemetryErrorChain(err error) []error {
 // errors.Join, and net/http chains without opening a callback boundary to an
 // arbitrary error implementation. Unknown wrappers are intentionally opaque.
 func telemetryStandardErrorChildren(err error) []error {
-	switch typed := err.(type) {
+	switch typed := err.(type) { //nolint:errorlint // Inspect one allowlisted chain link without invoking hostile Is/As/Unwrap methods.
 	case *url.Error:
 		if typed != nil {
 			return []error{typed.Err}
@@ -407,7 +407,7 @@ func chainHas(chain []error, predicate func(error) bool) bool {
 // interface comparison only compares values when their dynamic types are
 // identical, and every sentinel passed here has a comparable concrete type.
 func linkIs(link, sentinel error) bool {
-	return link == sentinel
+	return link == sentinel //nolint:errorlint // Inspect one allowlisted chain link without invoking hostile Is/As/Unwrap methods.
 }
 
 // classifyTransportError maps a transport error surfaced by this SDK's
@@ -482,7 +482,7 @@ func isTimeoutLink(link error) bool {
 	if linkIs(link, context.DeadlineExceeded) || linkIs(link, os.ErrDeadlineExceeded) {
 		return true
 	}
-	switch typed := link.(type) {
+	switch typed := link.(type) { //nolint:errorlint // Inspect one allowlisted chain link without invoking hostile Is/As/Unwrap methods.
 	case *net.DNSError:
 		return typed != nil && typed.IsTimeout
 	case syscall.Errno:
@@ -498,7 +498,7 @@ func isTimeoutLink(link error) bool {
 }
 
 func opLink(link error, op string) bool {
-	opErr, ok := link.(*net.OpError)
+	opErr, ok := link.(*net.OpError) //nolint:errorlint // Inspect one allowlisted chain link without invoking hostile Is/As/Unwrap methods.
 	return ok && opErr.Op == op
 }
 
@@ -520,7 +520,7 @@ func isTLSHandshakeTimeoutLink(link error) bool {
 }
 
 func isDNSLink(link error) bool {
-	_, ok := link.(*net.DNSError)
+	_, ok := link.(*net.DNSError) //nolint:errorlint // Inspect one allowlisted chain link without invoking hostile Is/As/Unwrap methods.
 	return ok
 }
 
@@ -540,7 +540,7 @@ func isTLSLink(link error) bool {
 	if linkIs(link, http.ErrSchemeMismatch) {
 		return true
 	}
-	switch link.(type) {
+	switch link.(type) { //nolint:errorlint // Inspect one allowlisted chain link without invoking hostile Is/As/Unwrap methods.
 	case *tls.CertificateVerificationError,
 		tls.RecordHeaderError,
 		tls.AlertError,
@@ -930,7 +930,7 @@ func newRequestRecorder(sink telemetrySink, facts telemetryRequestFacts, streami
 // standard-library wrapper must cost at most a missing telemetry record,
 // never the user's request (§2.2).
 func recoverTelemetryPanic() {
-	_ = recover()
+	_ = recover() //nolint:errcheck // Telemetry panic payloads are deliberately discarded to protect the user request.
 }
 
 // beginAttempt marks the start of the attempt about to be sent to baseURL.
@@ -1515,7 +1515,7 @@ func (b *telemetryBody) Read(p []byte) (int, error) {
 func (b *telemetryBody) observeReadError(err error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if err == io.EOF {
+	if linkIs(err, io.EOF) {
 		b.sawEOF = true
 		return
 	}

@@ -529,7 +529,7 @@ func telemetryHex(n int) string {
 	buf := make([]byte, n)
 	if _, err := io.ReadFull(rand.Reader, buf); err != nil {
 		var fallback [16]byte
-		binary.BigEndian.PutUint64(fallback[0:8], uint64(time.Now().UnixNano()))
+		binary.BigEndian.PutUint64(fallback[0:8], uint64(time.Now().UnixNano())) //nolint:gosec // G115: encode timestamp bits for uniqueness, not arithmetic.
 		binary.BigEndian.PutUint64(fallback[8:16], idempotencyFallbackSequence.Add(1))
 		for i := range buf {
 			buf[i] = fallback[i%len(fallback)]
@@ -1159,7 +1159,7 @@ func (r *telemetryReporter) flushOnce(ctx context.Context) bool {
 	if r.debug {
 		// A trust feature (§6.3): the exact bytes about to leave, on
 		// stderr, before they leave.
-		fmt.Fprintln(r.debugOut, "trustedrouter telemetry batch: "+string(selected.payload))
+		fmt.Fprintln(r.debugOut, "trustedrouter telemetry batch: "+string(selected.payload)) //nolint:errcheck // Optional diagnostics cannot change delivery semantics.
 	}
 	status, headers, body, err := r.post(ctx, apiKey, selected.payload)
 	if err != nil {
@@ -1196,8 +1196,11 @@ func (r *telemetryReporter) post(ctx context.Context, apiKey string, payload []b
 	if err != nil {
 		return 0, nil, nil, err
 	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, telemetryMaxBatchBytes))
+	defer resp.Body.Close() //nolint:errcheck // Close is best-effort cleanup; preserve the completed operation result.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, telemetryMaxBatchBytes))
+	if err != nil {
+		return resp.StatusCode, resp.Header, nil, nil
+	} // A received status owns acknowledgement; incomplete optional policy is discarded.
 	return resp.StatusCode, resp.Header, body, nil
 }
 

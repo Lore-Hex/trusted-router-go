@@ -695,7 +695,10 @@ func toolCallIndex(tc map[string]any) int {
 	case float64:
 		return int(value)
 	case json.Number:
-		parsed, _ := value.Int64()
+		parsed, err := value.Int64()
+		if err != nil {
+			return 0
+		}
 		return int(parsed)
 	default:
 		return 0

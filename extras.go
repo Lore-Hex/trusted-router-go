@@ -5,7 +5,11 @@ package trustedrouter
 // extra_headers) into typed CallOptions before a request is built. Typed
 // CallOptions always win over Extra-map values.
 
-import "time"
+import (
+	"net/http"
+	"sort"
+	"time"
+)
 
 func chatCallOptions(req ChatRequest) CallOptions {
 	callOpts := req.CallOptions
@@ -31,14 +35,7 @@ func chatCallOptions(req ChatRequest) CallOptions {
 		}
 	}
 	if headers := headersExtra(extra, "extra_headers"); len(headers) > 0 {
-		merged := make(map[string]string, len(headers)+len(callOpts.ExtraHeaders))
-		for key, value := range headers {
-			merged[key] = value
-		}
-		for key, value := range callOpts.ExtraHeaders {
-			merged[key] = value
-		}
-		callOpts.ExtraHeaders = merged
+		callOpts.ExtraHeaders = mergeHeaders(headers, callOpts.ExtraHeaders)
 	}
 	return callOpts
 }
@@ -68,14 +65,7 @@ func responsesCallOptions(req ResponsesRequest, routeAllReserved bool) CallOptio
 	}
 	if routeAllReserved {
 		if headers := headersExtra(extra, "extra_headers"); len(headers) > 0 {
-			merged := make(map[string]string, len(headers)+len(callOpts.ExtraHeaders))
-			for key, value := range headers {
-				merged[key] = value
-			}
-			for key, value := range callOpts.ExtraHeaders {
-				merged[key] = value
-			}
-			callOpts.ExtraHeaders = merged
+			callOpts.ExtraHeaders = mergeHeaders(headers, callOpts.ExtraHeaders)
 		}
 	}
 	return callOpts
@@ -128,4 +118,25 @@ func headersExtra(extra map[string]any, key string) map[string]string {
 	default:
 		return nil
 	}
+}
+
+// mergeHeaders keeps the public single-value API while merging case-insensitively.
+// Sorting resolves duplicate spellings within a layer deterministically.
+func mergeHeaders(layers ...map[string]string) map[string]string {
+	headers := make(http.Header)
+	for _, layer := range layers {
+		keys := make([]string, 0, len(layer))
+		for key := range layer {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			headers.Set(key, layer[key])
+		}
+	}
+	out := make(map[string]string, len(headers))
+	for key := range headers {
+		out[key] = headers.Get(key)
+	}
+	return out
 }

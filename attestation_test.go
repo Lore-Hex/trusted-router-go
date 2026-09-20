@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/big"
 	"net/http"
 	"net/http/cookiejar"
@@ -727,7 +728,7 @@ func newAttestationFixture(t *testing.T) attestationFixture {
 		jwks: map[string]any{"keys": []any{map[string]any{
 			"kty": "RSA",
 			"kid": kid,
-			"n":   base64.RawURLEncoding.EncodeToString(key.PublicKey.N.Bytes()),
+			"n":   base64.RawURLEncoding.EncodeToString(key.N.Bytes()),
 			"e":   base64.RawURLEncoding.EncodeToString(big.NewInt(int64(key.PublicKey.E)).Bytes()),
 		}}},
 		policy: AttestationPolicy{
@@ -827,5 +828,90 @@ func attestationTestResponse(status int, body string) *http.Response {
 		StatusCode: status,
 		Header:     http.Header{"Content-Type": []string{"application/json"}},
 		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+}
+
+func TestAttestationKeyIDShape(t *testing.T) {
+	for _, kid := range []any{nil, 7, []any{"key"}, map[string]any{"id": "key"}} {
+		t.Run(fmt.Sprint(kid), func(t *testing.T) {
+			err := verifyRS256(map[string]any{"keys": []any{map[string]any{"kid": kid}}}, map[string]any{"alg": "RS256", "kid": kid}, nil, nil)
+			var typed *AttestationVerificationError
+			if !errors.As(err, &typed) || !strings.Contains(err.Error(), "kid must") {
+				t.Fatalf("invalid kid: %v", err)
+			}
+		})
+	}
+	// Wrong-shaped JWKS IDs must not panic when the JWT ID is valid.
+	err := verifyRS256(map[string]any{"keys": []any{map[string]any{"kid": []any{"key"}}}}, map[string]any{"alg": "RS256", "kid": "key"}, nil, nil)
+	if err == nil {
+		t.Fatal("accepted malformed JWKS")
+	}
+}
+
+func TestAttestationJSONObjectBoundary(t *testing.T) {
+	for _, raw := range []string{`null`, `[]`, `{} {}`, `{"kid":"a","kid":"b"}`, `{"exp":1} trailing`} {
+		if _, err := decodeJSONObject([]byte(raw)); err == nil {
+			t.Fatalf("accepted %s", raw)
+		}
+	}
+	obj, err := decodeJSONObject([]byte(`{"id":9007199254740993,"future":[null]}`))
+	if err != nil || obj["id"] != json.Number("9007199254740993") {
+		t.Fatalf("lost numeric precision: %v, %v", obj, err)
+	}
+}
+
+func TestJWKSJSONObjectBoundary(t *testing.T) {
+	for _, raw := range []string{`{"keys":[]} {}`, `{"keys":[],"keys":[]}`} {
+		client := newRoundTripClient(func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(raw))}, nil
+		})
+		_, err := fetchJWKS(context.Background(), "https://example.test/jwks", client)
+		var typed *AttestationVerificationError
+		if !errors.As(err, &typed) {
+			t.Fatalf("accepted %s: %v", raw, err)
+		}
+	}
+}
+
+func TestEmptyImagePinCannotMatchMissingClaim(t *testing.T) {
+	fixture := newAttestationFixture(t)
+	for _, field := range []string{"image_digest", "image_reference"} {
+		for _, value := range []any{nil, 7, ""} {
+			claims := fixture.claims(map[string]any{"submods": map[string]any{"container": map[string]any{field: value}}})
+			policy := AttestationPolicy{ExpectedImageDigests: []string{""}}
+			if field == "image_reference" {
+				policy = AttestationPolicy{ExpectedImageReferences: []string{""}}
+			}
+			_, err := checkAttestationClaims(claims, policy, "", nil, nil)
+			var typed *AttestationVerificationError
+			if !errors.As(err, &typed) || !strings.Contains(err.Error(), field+" mismatch") {
+				t.Fatalf("empty pin matched %s=%v: %v", field, value, err)
+			}
+		}
+	}
+}
+
+func TestAttestationIntegerBounds(t *testing.T) {
+	for _, value := range []any{math.Inf(1), math.Inf(-1), math.NaN(), float64(0x1p63), -0x1p64, json.Number("9223372036854775808"), json.Number("1e100")} {
+		if got, ok := intClaim(value); ok {
+			t.Fatalf("accepted %v as %d", value, got)
+		}
+	}
+	for _, value := range []any{float64(42), json.Number("42.0"), json.Number("9223372036854775807")} {
+		if _, ok := intClaim(value); !ok {
+			t.Fatalf("rejected %v", value)
+		}
+	}
+}
+
+func TestJWKSReadError(t *testing.T) {
+	client := newRoundTripClient(func(*http.Request) (*http.Response, error) {
+		body := io.MultiReader(strings.NewReader(`{"keys":[]}`), hostileBody{err: io.ErrUnexpectedEOF})
+		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(body)}, nil
+	})
+	_, err := fetchJWKS(context.Background(), "https://example.test/jwks", client)
+	var typed *AttestationVerificationError
+	if !errors.As(err, &typed) || !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("read failure lost: %v", err)
 	}
 }

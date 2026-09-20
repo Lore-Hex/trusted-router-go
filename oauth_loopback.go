@@ -101,11 +101,17 @@ func StartOAuthLoopback(opts OAuthLoopbackOptions) (*OAuthLoopback, error) {
 		port = DefaultOAuthLoopbackPort
 	}
 
-	listener, err := net.Listen("tcp", fmt.Sprintf("%s:%d", defaultOAuthLoopbackBindHost, port))
+	listener, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", fmt.Sprintf("%s:%d", defaultOAuthLoopbackBindHost, port))
 	if err != nil {
 		return nil, err
 	}
-	port = listener.Addr().(*net.TCPAddr).Port
+	port, err = oauthLoopbackPort(listener.Addr())
+	if err != nil {
+		if closeErr := listener.Close(); closeErr != nil {
+			return nil, errors.Join(err, closeErr)
+		}
+		return nil, err
+	}
 	loopback := &OAuthLoopback{
 		listener:      listener,
 		callbackURL:   fmt.Sprintf("http://%s:%d%s", defaultOAuthLoopbackCallbackHost, port, path),
@@ -116,10 +122,10 @@ func StartOAuthLoopback(opts OAuthLoopbackOptions) (*OAuthLoopback, error) {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc(path, loopback.handleCallback)
-	loopback.server = &http.Server{Handler: mux}
+	loopback.server = &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 	go func() {
 		err := loopback.server.Serve(listener)
-		if err != nil && err != http.ErrServerClosed {
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			loopback.deliver(oauthLoopbackResult{err: err})
 		}
 	}()
@@ -144,7 +150,7 @@ func (l *OAuthLoopback) Wait(ctx context.Context) (OAuthLoopbackResult, error) {
 	if l == nil {
 		return OAuthLoopbackResult{}, errors.New("nil OAuthLoopback")
 	}
-	defer l.Close()
+	defer l.Close() //nolint:errcheck // Close is best-effort cleanup; preserve the completed operation result.
 	select {
 	case result := <-l.result:
 		return result.value, result.err
@@ -233,7 +239,7 @@ func writeHTMLResponse(w http.ResponseWriter, status int, body string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	w.WriteHeader(status)
-	_, _ = w.Write([]byte(body))
+	_, _ = w.Write([]byte(body)) //nolint:errcheck // Browser disconnect cannot revoke a delivered OAuth result.
 	if flusher, ok := w.(http.Flusher); ok {
 		flusher.Flush()
 	}
@@ -242,3 +248,11 @@ func writeHTMLResponse(w http.ResponseWriter, status int, body string) {
 const defaultOAuthLoopbackSuccessHTML = `<!doctype html><html><head><meta charset="utf-8"><title>Signed in</title></head><body><h1>Signed in with TrustedRouter</h1><p>You can close this tab and return to the app.</p></body></html>`
 
 const defaultOAuthLoopbackDenyHTML = `<!doctype html><html><head><meta charset="utf-8"><title>Sign in failed</title></head><body><h1>TrustedRouter sign in failed</h1><p>{{message}}</p></body></html>`
+
+func oauthLoopbackPort(addr net.Addr) (int, error) {
+	tcp, ok := addr.(*net.TCPAddr)
+	if !ok || tcp == nil {
+		return 0, errors.New("OAuth listener did not return a TCP address")
+	}
+	return tcp.Port, nil
+}

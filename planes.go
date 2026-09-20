@@ -23,7 +23,7 @@ func (c *Client) Request(ctx context.Context, method, path string, body any, out
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // Close is best-effort cleanup; preserve the completed operation result.
 	return decodeResponse(ctx, resp, out)
 }
 
@@ -43,7 +43,7 @@ func (c *Client) controlRequest(ctx context.Context, method, path string, body a
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // Close is best-effort cleanup; preserve the completed operation result.
 	return decodeResponse(ctx, resp, out)
 }
 
@@ -52,7 +52,7 @@ func (c *Client) credentialFreeControlRequest(ctx context.Context, method, path 
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // Close is best-effort cleanup; preserve the completed operation result.
 	return decodeResponse(ctx, resp, out)
 }
 

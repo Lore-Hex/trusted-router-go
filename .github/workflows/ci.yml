@@ -24,10 +24,16 @@ jobs:
       - name: go mod tidy diff
         run: go mod tidy -diff
 
+      - name: boundary static checks
+        run: go run ./scripts/boundary-check
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.6.0
+
       - name: go test race
         run: go test -race ./...
 
-      - name: staticcheck
-        run: |
-          go install honnef.co/go/tools/cmd/staticcheck@2025.1.1
-          staticcheck ./...
+      - name: mutation and static negative checks
+        run: go run ./scripts/mutation-check

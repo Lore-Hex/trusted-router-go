@@ -135,7 +135,7 @@ func (c *Client) ResponsesEvents(ctx context.Context, req ResponsesRequest) iter
 			yield(nil, err)
 			return
 		}
-		defer resp.Body.Close()
+		defer resp.Body.Close() //nolint:errcheck // Close is best-effort cleanup; preserve the completed operation result.
 
 		for event, err := range iterSSEEvents(resp.Body) {
 			if err != nil {

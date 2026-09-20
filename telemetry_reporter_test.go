@@ -932,3 +932,16 @@ func TestTelemetryReporter413DropsSelectedBatch(t *testing.T) {
 		t.Fatalf("after 413 events/windows/dropped = %d/%d/%d, want 0/0/2", events, windows, dropped)
 	}
 }
+
+func TestTelemetryPartialPolicyIsDiscarded(t *testing.T) {
+	reporter := newReporterForTest("https://example.test", nil)
+	reporter.httpClient = newRoundTripClient(func(*http.Request) (*http.Response, error) {
+		body := io.MultiReader(strings.NewReader(`{"policy":{"pause_seconds":3600}}`), hostileBody{err: io.ErrUnexpectedEOF})
+		return &http.Response{StatusCode: http.StatusAccepted, Header: make(http.Header), Body: io.NopCloser(body)}, nil
+	})
+	defer stopReporterForTest(t, reporter)
+	status, _, body, err := reporter.post(context.Background(), "key", []byte(`{}`))
+	if err != nil || status != http.StatusAccepted || body != nil {
+		t.Fatalf("partial policy: status=%d body=%s err=%v", status, body, err)
+	}
+}

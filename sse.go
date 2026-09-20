@@ -151,7 +151,10 @@ func iterSSEChunks(r io.Reader) iter.Seq2[map[string]any, error] {
 }
 
 func eventFromSSEFrame(lines []string) map[string]any {
-	event, _, _ := parseSSEFrame(lines)
+	event, _, err := parseSSEFrame(lines)
+	if err != nil {
+		return nil
+	}
 	return event
 }
 
@@ -247,7 +250,7 @@ func isTerminalResponseEvent(eventName string, payload map[string]any) bool {
 }
 
 func raiseForStreamResponse(resp *http.Response) error {
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // Close is best-effort cleanup; preserve the completed operation result.
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return transportRetryError(err)

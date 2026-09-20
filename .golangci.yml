@@ -1,0 +1,29 @@
+version: "2"
+run:
+  timeout: 5m
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - forcetypeassert
+    - errorlint
+    - bodyclose
+    - noctx
+    - nilerr
+    - unconvert
+    - gosec
+  settings:
+    errcheck:
+      check-blank: true
+  exclusions:
+    presets: []
+    rules:
+      # Test fixtures deliberately use unchecked writes/assertions and synthetic TLS.
+      - path: _test\.go
+        linters: [errcheck, forcetypeassert, errorlint, bodyclose, noctx, gosec]
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

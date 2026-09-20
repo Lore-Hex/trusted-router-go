@@ -154,7 +154,7 @@ func TestAccountEndpointsAndStatusWireShape(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Data.Sub != "user_1" || info.Data.Extra["plan"] != "pro" {
+	if (info.Data.Sub == nil || *info.Data.Sub != "user_1") || info.Data.Extra["plan"] != "pro" {
 		t.Fatalf("userinfo = %#v", info)
 	}
 	activity, err := client.Activity(context.Background(), map[string]string{
