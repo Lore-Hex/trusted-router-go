@@ -122,7 +122,7 @@ func cmdChat(ctx context.Context, globals globalOptions, argv []string) int {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 2
 	}
-	defer client.Close()
+	defer client.Close() //nolint:errcheck // Close is best-effort cleanup; preserve the completed operation result.
 	req := trustedrouter.ChatRequest{
 		Model:    model,
 		Messages: []map[string]any{{"role": "user", "content": prompt}},
@@ -156,7 +156,7 @@ func cmdList(ctx context.Context, globals globalOptions, name string) int {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 2
 	}
-	defer client.Close()
+	defer client.Close() //nolint:errcheck // Close is best-effort cleanup; preserve the completed operation result.
 	switch name {
 	case "models":
 		value, err := client.Models(ctx, nil)
@@ -207,7 +207,7 @@ func cmdAttest(ctx context.Context, globals globalOptions, argv []string) int {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 2
 	}
-	defer client.Close()
+	defer client.Close() //nolint:errcheck // Close is best-effort cleanup; preserve the completed operation result.
 	if sessionMode {
 		return cmdAttestSession(ctx, client.BaseURL(), connectIP)
 	}
@@ -220,7 +220,9 @@ func cmdAttest(ctx context.Context, globals globalOptions, argv []string) int {
 		return printCLIError(err, false)
 	}
 	if !verify {
-		_, _ = os.Stdout.Write(doc)
+		if _, err := os.Stdout.Write(doc); err != nil {
+			return printCLIError(err, false)
+		}
 		return 0
 	}
 	certDER, err := fetchTLSCertDER(ctx, client.BaseURL())
@@ -259,7 +261,7 @@ func cmdAttestSession(ctx context.Context, baseURL string, connectIP string) int
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		return 1
 	}
-	defer session.Conn.Close()
+	defer session.Conn.Close() //nolint:errcheck // Close is best-effort cleanup; preserve the completed operation result.
 
 	fmt.Println("JWT ok")
 	fmt.Printf("image_digest ok: %s\n", session.Attestation.ImageDigest)
@@ -300,13 +302,13 @@ func fetchTLSCertDER(ctx context.Context, baseURL string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer raw.Close()
+	defer raw.Close() //nolint:errcheck // Close is best-effort cleanup; preserve the completed operation result.
 	conn := tls.Client(raw, &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12})
 	if err := conn.HandshakeContext(dialCtx); err != nil {
-		_ = conn.Close()
+		_ = conn.Close() //nolint:errcheck // Close is best-effort cleanup; preserve the completed operation result.
 		return nil, err
 	}
-	defer conn.Close()
+	defer conn.Close() //nolint:errcheck // Close is best-effort cleanup; preserve the completed operation result.
 	state := conn.ConnectionState()
 	if len(state.PeerCertificates) == 0 {
 		return nil, fmt.Errorf("no peer certificates")

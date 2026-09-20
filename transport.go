@@ -429,8 +429,8 @@ func newIdempotencyKeyWithEntropy(entropy io.Reader) string {
 	// process ID, nanosecond timestamp, and atomic sequence make this fallback
 	// unique for concurrent calls in one process and collision-resistant across
 	// independently started clients.
-	binary.BigEndian.PutUint64(b[0:8], uint64(time.Now().UnixNano()))
-	binary.BigEndian.PutUint64(b[8:16], uint64(os.Getpid()))
+	binary.BigEndian.PutUint64(b[0:8], uint64(time.Now().UnixNano())) //nolint:gosec // G115: encode timestamp bits for uniqueness, not arithmetic.
+	binary.BigEndian.PutUint64(b[8:16], uint64(os.Getpid()))          //nolint:gosec // G115: OS process IDs are nonnegative.
 	binary.BigEndian.PutUint64(b[16:24], idempotencyFallbackSequence.Add(1))
 	return "tr-req-" + base64.RawURLEncoding.EncodeToString(b[:])
 }
@@ -524,7 +524,7 @@ func retrySleepDuration(attempt int, retryAfter *float64) time.Duration {
 	if base > 30*time.Second {
 		base = 30 * time.Second
 	}
-	delay := time.Duration(mathrand.Float64() * float64(base))
+	delay := time.Duration(mathrand.Float64() * float64(base)) //nolint:gosec // G404: retry jitter is not security entropy.
 	if retryAfter != nil {
 		// Re-clamp rather than trusting the caller: retrySleepDuration is
 		// reachable independently of the parser, and float64->time.Duration
@@ -563,8 +563,8 @@ func sleepForRetry(ctx context.Context, attempt int, retryAfter *float64) error 
 
 func drainAndClose(body io.ReadCloser) {
 	// Divergence from trusted-router-py: drain errors on failoverable bodies are ignored and retried.
-	_, _ = io.Copy(io.Discard, body)
-	_ = body.Close()
+	_, _ = io.Copy(io.Discard, body) //nolint:errcheck // A failed drain still closes the failed attempt before retry.
+	_ = body.Close()                 //nolint:errcheck // Close is best-effort cleanup; preserve the completed operation result.
 }
 
 type cancelOnCloseReadCloser struct {

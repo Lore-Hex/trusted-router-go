@@ -425,7 +425,7 @@ func VerifyReceipt(receipt any, expectedIssuer string, opts VerifyReceiptOptions
 		if !valid {
 			return nil, receiptUpstream("upstream.verification_expires_at check failed: expected an integer", nil)
 		}
-		if !(verified <= iat && iat < expires) {
+		if verified > iat || iat >= expires {
 			return nil, receiptUpstream("tee-verified window check failed: expected verified_at <= iat < verification_expires_at", nil)
 		}
 		verifiedAt, expiresAt = &verified, &expires
@@ -858,7 +858,7 @@ func decodeReceiptSSEEvent(raw []byte) (receiptSSEEvent, error) {
 func embeddedReceiptFromPayload(payload []byte) (map[string]any, error) {
 	decoded, err := decodeReceiptJSON(payload, "response stream event JSON")
 	if err != nil {
-		return nil, nil
+		return nil, nil //nolint:nilerr // SSE domains hash arbitrary payload bytes; non-JSON is not a receipt candidate.
 	}
 	object, ok := decoded.(map[string]any)
 	if !ok {
@@ -943,7 +943,7 @@ func receiptB64URLDecode(value string, check string) ([]byte, error) {
 		return nil, receiptStructure(check+" check failed: invalid base64url encoding", nil)
 	}
 	for _, char := range value {
-		if !(char >= 'A' && char <= 'Z' || char >= 'a' && char <= 'z' || char >= '0' && char <= '9' || char == '_' || char == '-') {
+		if (char < 'A' || char > 'Z') && (char < 'a' || char > 'z') && (char < '0' || char > '9') && char != '_' && char != '-' {
 			return nil, receiptStructure(check+" check failed: invalid base64url encoding", nil)
 		}
 	}

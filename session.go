@@ -96,13 +96,13 @@ func VerifyGatewaySession(ctx context.Context, opts VerifyGatewaySessionOptions)
 	}
 	conn, ok := rawConn.(*tls.Conn)
 	if !ok {
-		_ = rawConn.Close()
+		_ = rawConn.Close() //nolint:errcheck // Close is best-effort cleanup; preserve the completed operation result.
 		return nil, fmt.Errorf("TLS dial returned %T, want *tls.Conn", rawConn)
 	}
 	success := false
 	defer func() {
 		if !success {
-			_ = conn.Close()
+			_ = conn.Close() //nolint:errcheck // Close is best-effort cleanup; preserve the completed operation result.
 		}
 	}()
 
@@ -272,7 +272,7 @@ func fetchAttestationOnConn(ctx context.Context, conn *tls.Conn, reader *bufio.R
 		return nil, err
 	}
 	if err := requireGatewaySessionKeepAlive(resp); err != nil {
-		_ = conn.Close()
+		_ = conn.Close() //nolint:errcheck // Close is best-effort cleanup; preserve the completed operation result.
 		return nil, err
 	}
 	if resp.statusCode != http.StatusOK {
@@ -408,19 +408,19 @@ func setConnContextDeadline(ctx context.Context, conn net.Conn, timeout time.Dur
 		deadline = ctxDeadline
 	}
 	if !deadline.IsZero() {
-		_ = conn.SetDeadline(deadline)
+		_ = conn.SetDeadline(deadline) //nolint:errcheck // This live TLS connection supports deadlines; a concurrent close makes failure harmless.
 	}
 
 	done := make(chan struct{})
 	go func() {
 		select {
 		case <-ctx.Done():
-			_ = conn.SetDeadline(time.Now())
+			_ = conn.SetDeadline(time.Now()) //nolint:errcheck // This live TLS connection supports deadlines; a concurrent close makes failure harmless.
 		case <-done:
 		}
 	}()
 	return func() {
 		close(done)
-		_ = conn.SetDeadline(time.Time{})
+		_ = conn.SetDeadline(time.Time{}) //nolint:errcheck // This live TLS connection supports deadlines; a concurrent close makes failure harmless.
 	}
 }

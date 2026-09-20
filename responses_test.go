@@ -315,6 +315,7 @@ func TestResponsesEventsMidReadErrorIsWrapped(t *testing.T) {
 	}
 }
 
+//nolint:staticcheck // Explicit function types are compile-time public API compatibility assertions (QF1011).
 func TestClientIncrementSurfaceParitySmoke(t *testing.T) {
 	var _ func(*Client, context.Context, ChatRequest) (*ChatCompletion, error) = (*Client).ChatCompletions
 	var _ func(*Client, context.Context, ChatRequest) iter.Seq2[ChatCompletionChunk, error] = (*Client).ChatCompletionsChunks

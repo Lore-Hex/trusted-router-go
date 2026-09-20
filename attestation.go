@@ -1,7 +1,6 @@
 package trustedrouter
 
 import (
-	"bytes"
 	"context"
 	"crypto"
 	"crypto/hmac"
@@ -304,7 +303,7 @@ func (c *Client) Attestation(ctx context.Context) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // Close is best-effort cleanup; preserve the completed operation result.
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -332,7 +331,7 @@ func (c *Client) TrustRelease(ctx context.Context, trustURL string) (*TrustRelea
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // Close is best-effort cleanup; preserve the completed operation result.
 	var out TrustRelease
 	if err := decodeResponse(ctx, resp, &out); err != nil {
 		return nil, err
@@ -418,7 +417,7 @@ func fetchTrustRelease(ctx context.Context, trustURL string, httpClient *http.Cl
 		}
 		return nil, transportRetryError(err)
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // Close is best-effort cleanup; preserve the completed operation result.
 	var out TrustRelease
 	if err := decodeResponse(requestCtx, resp, &out); err != nil {
 		return nil, err
@@ -450,14 +449,16 @@ func fetchJWKS(ctx context.Context, jwksURL string, httpClient *http.Client) (ma
 		}
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck // Close is best-effort cleanup; preserve the completed operation result.
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return nil, attestationErr(fmt.Sprintf("JWKS fetch returned HTTP %d", resp.StatusCode), nil)
 	}
-	var out map[string]any
-	decoder := json.NewDecoder(resp.Body)
-	decoder.UseNumber()
-	if err := decoder.Decode(&out); err != nil {
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, attestationErr("cannot read JWKS response", err)
+	}
+	out, err := decodeJSONObject(body)
+	if err != nil {
 		return nil, attestationErr("JWKS response is not JSON", err)
 	}
 	if _, ok := jwksKeys(out); !ok {
@@ -514,11 +515,13 @@ func b64urlDecode(segment string) ([]byte, error) {
 }
 
 func decodeJSONObject(data []byte) (map[string]any, error) {
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.UseNumber()
-	var out map[string]any
-	if err := decoder.Decode(&out); err != nil {
+	value, err := decodeReceiptJSON(data, "attestation JSON")
+	if err != nil {
 		return nil, err
+	}
+	out, ok := value.(map[string]any)
+	if !ok || out == nil {
+		return nil, attestationErr("attestation JSON must be an object", nil)
 	}
 	return out, nil
 }
@@ -527,7 +530,10 @@ func verifyRS256(jwks map[string]any, header map[string]any, signingInput []byte
 	if header["alg"] != "RS256" {
 		return attestationErr(fmt.Sprintf("unsupported JWT alg %s; expected RS256", pyRepr(header["alg"])), nil)
 	}
-	kid := header["kid"]
+	kid, kidOK := header["kid"].(string)
+	if !kidOK || kid == "" {
+		return attestationErr("JWT kid must be a non-empty string", nil)
+	}
 	keys, ok := jwksKeys(jwks)
 	if !ok {
 		return attestationErr(fmt.Sprintf("GCP JWKS at %s returned unexpected shape", GCPJWKSURI), nil)
@@ -766,11 +772,11 @@ func intClaim(value any) (int64, bool) {
 			return i, true
 		}
 		f, err := v.Float64()
-		if err == nil && math.Trunc(f) == f {
+		if err == nil && validInt64Float(f) {
 			return int64(f), true
 		}
 	case float64:
-		if math.Trunc(v) == v {
+		if validInt64Float(v) {
 			return int64(v), true
 		}
 	case int:
@@ -781,6 +787,10 @@ func intClaim(value any) (int64, bool) {
 		return int64(v), true
 	}
 	return 0, false
+}
+
+func validInt64Float(value float64) bool {
+	return !math.IsNaN(value) && !math.IsInf(value, 0) && value >= -0x1p63 && value < 0x1p63 && math.Trunc(value) == value
 }
 
 func audienceList(value any) []string {
@@ -854,6 +864,9 @@ func safeEq(a, b string) bool {
 }
 
 func containsSafeString(values []string, target string) bool {
+	if target == "" {
+		return false
+	}
 	for _, value := range values {
 		if safeEq(value, target) {
 			return true

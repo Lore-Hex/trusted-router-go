@@ -1,0 +1,149 @@
+[
+  {
+    "name": "exchange-required-key",
+    "file": "oauth.go",
+    "before": "if err := requireJSONField(data, \"key\", '\"'); err != nil {\n\t\treturn err\n\t}",
+    "after": "",
+    "test": "TestAuthWireFixtures"
+  },
+  {
+    "name": "userinfo-required-object",
+    "file": "account.go",
+    "before": "if err := requireJSONField(data, \"data\", '{'); err != nil {\n\t\treturn err\n\t}",
+    "after": "",
+    "test": "TestAuthWireFixtures"
+  },
+  {
+    "name": "auth-required-field-shape",
+    "file": "boundary.go",
+    "before": "if len(raw) == 0 || raw[0] != kind {",
+    "after": "if len(raw) < 0 || kind == 0 {",
+    "test": "TestAuthWireFixtures"
+  },
+  {
+    "name": "legacy-null-subject",
+    "file": "account.go",
+    "before": "*u = UserInfoData(out)",
+    "after": "if out.Sub == nil { empty := \"\"; out.Sub = &empty }; *u = UserInfoData(out)",
+    "test": "TestAuthWireFixtures"
+  },
+  {
+    "name": "wire-fixture-no-required-data",
+    "file": "oauth.go",
+    "before": "requireJSONField(data, \"key\", '\"')",
+    "after": "requireJSONField(data, \"data\", '{')",
+    "test": "TestAuthWireFixtures"
+  },
+  {
+    "name": "jwt-key-id-shape",
+    "file": "attestation.go",
+    "before": "kid, kidOK := header[\"kid\"].(string)\n\tif !kidOK || kid == \"\" {\n\t\treturn attestationErr(\"JWT kid must be a non-empty string\", nil)\n\t}",
+    "after": "kid := header[\"kid\"]",
+    "test": "TestAttestationKeyIDShape"
+  },
+  {
+    "name": "trust-json-strict-decoding",
+    "file": "attestation.go",
+    "before": "value, err := decodeReceiptJSON(data, \"attestation JSON\")",
+    "after": "var value any; decoder := json.NewDecoder(strings.NewReader(string(data))); decoder.UseNumber(); err := decoder.Decode(&value)",
+    "test": "TestAttestationJSONObjectBoundary"
+  },
+  {
+    "name": "trust-json-object-shape",
+    "file": "attestation.go",
+    "before": "if !ok || out == nil {",
+    "after": "if !ok && value != nil {",
+    "test": "TestAttestationJSONObjectBoundary"
+  },
+  {
+    "name": "jwks-strict-decoding",
+    "file": "attestation.go",
+    "before": "out, err := decodeJSONObject(body)",
+    "after": "var out map[string]any; decoder := json.NewDecoder(strings.NewReader(string(body))); decoder.UseNumber(); err = decoder.Decode(&out)",
+    "test": "TestJWKSJSONObjectBoundary"
+  },
+  {
+    "name": "nonempty-image-claim",
+    "file": "attestation.go",
+    "before": "func containsSafeString(values []string, target string) bool {\n\tif target == \"\" {\n\t\treturn false\n\t}",
+    "after": "func containsSafeString(values []string, target string) bool {",
+    "test": "TestEmptyImagePinCannotMatchMissingClaim"
+  },
+  {
+    "name": "expiration-float-bounds",
+    "file": "attestation.go",
+    "before": "return !math.IsNaN(value) && !math.IsInf(value, 0) && value >= -0x1p63 && value < 0x1p63 && math.Trunc(value) == value",
+    "after": "return math.Trunc(value) == value",
+    "test": "TestAttestationIntegerBounds"
+  },
+  {
+    "name": "chatCallOptions-header-merge",
+    "file": "extras.go",
+    "before": "func chatCallOptions(req ChatRequest) CallOptions {\n\tcallOpts := req.CallOptions\n\textra := req.Extra\n\tif callOpts.APIKey == nil {\n\t\tif value, ok := stringExtra(extra, \"api_key\"); ok {\n\t\t\tcallOpts.APIKey = &value\n\t\t}\n\t}\n\tif callOpts.WorkspaceID == nil {\n\t\tif value, ok := stringExtra(extra, \"workspace_id\"); ok {\n\t\t\tcallOpts.WorkspaceID = &value\n\t\t}\n\t}\n\tif callOpts.IdempotencyKey == \"\" {\n\t\tif value, ok := stringExtra(extra, \"idempotency_key\"); ok {\n\t\t\tcallOpts.IdempotencyKey = value\n\t\t}\n\t}\n\tif callOpts.Timeout == nil {\n\t\tif timeout, ok := timeoutExtra(extra, \"timeout\"); ok {\n\t\t\tcallOpts.Timeout = &timeout\n\t\t}\n\t}\n\tif headers := headersExtra(extra, \"extra_headers\"); len(headers) > 0 {\n\t\tcallOpts.ExtraHeaders = mergeHeaders(headers, callOpts.ExtraHeaders)\n\t}\n\treturn callOpts\n}",
+    "after": "func chatCallOptions(req ChatRequest) CallOptions {\n\tcallOpts := req.CallOptions\n\textra := req.Extra\n\tif callOpts.APIKey == nil {\n\t\tif value, ok := stringExtra(extra, \"api_key\"); ok {\n\t\t\tcallOpts.APIKey = &value\n\t\t}\n\t}\n\tif callOpts.WorkspaceID == nil {\n\t\tif value, ok := stringExtra(extra, \"workspace_id\"); ok {\n\t\t\tcallOpts.WorkspaceID = &value\n\t\t}\n\t}\n\tif callOpts.IdempotencyKey == \"\" {\n\t\tif value, ok := stringExtra(extra, \"idempotency_key\"); ok {\n\t\t\tcallOpts.IdempotencyKey = value\n\t\t}\n\t}\n\tif callOpts.Timeout == nil {\n\t\tif timeout, ok := timeoutExtra(extra, \"timeout\"); ok {\n\t\t\tcallOpts.Timeout = &timeout\n\t\t}\n\t}\n\tif headers := headersExtra(extra, \"extra_headers\"); len(headers) > 0 {\n\t\tmerged := map[string]string{}; for k,v := range headers { merged[k]=v }; for k,v := range callOpts.ExtraHeaders { merged[k]=v }; callOpts.ExtraHeaders=merged\n\t}\n\treturn callOpts\n}",
+    "test": "TestHeaderMergeCaseInsensitive"
+  },
+  {
+    "name": "responsesCallOptions-header-merge",
+    "file": "extras.go",
+    "before": "func responsesCallOptions(req ResponsesRequest, routeAllReserved bool) CallOptions {\n\tcallOpts := req.CallOptions\n\textra := req.Extra\n\tif routeAllReserved && callOpts.APIKey == nil {\n\t\tif value, ok := stringExtra(extra, \"api_key\"); ok {\n\t\t\tcallOpts.APIKey = &value\n\t\t}\n\t}\n\tif callOpts.WorkspaceID == nil {\n\t\tif value, ok := stringExtra(extra, \"workspace_id\"); ok {\n\t\t\tcallOpts.WorkspaceID = &value\n\t\t}\n\t}\n\tif routeAllReserved && callOpts.IdempotencyKey == \"\" {\n\t\tif value, ok := stringExtra(extra, \"idempotency_key\"); ok {\n\t\t\tcallOpts.IdempotencyKey = value\n\t\t}\n\t}\n\tif routeAllReserved && callOpts.Timeout == nil {\n\t\tif timeout, ok := timeoutExtra(extra, \"timeout\"); ok {\n\t\t\tcallOpts.Timeout = &timeout\n\t\t}\n\t}\n\tif routeAllReserved {\n\t\tif headers := headersExtra(extra, \"extra_headers\"); len(headers) > 0 {\n\t\t\tcallOpts.ExtraHeaders = mergeHeaders(headers, callOpts.ExtraHeaders)\n\t\t}\n\t}\n\treturn callOpts\n}",
+    "after": "func responsesCallOptions(req ResponsesRequest, routeAllReserved bool) CallOptions {\n\tcallOpts := req.CallOptions\n\textra := req.Extra\n\tif routeAllReserved && callOpts.APIKey == nil {\n\t\tif value, ok := stringExtra(extra, \"api_key\"); ok {\n\t\t\tcallOpts.APIKey = &value\n\t\t}\n\t}\n\tif callOpts.WorkspaceID == nil {\n\t\tif value, ok := stringExtra(extra, \"workspace_id\"); ok {\n\t\t\tcallOpts.WorkspaceID = &value\n\t\t}\n\t}\n\tif routeAllReserved && callOpts.IdempotencyKey == \"\" {\n\t\tif value, ok := stringExtra(extra, \"idempotency_key\"); ok {\n\t\t\tcallOpts.IdempotencyKey = value\n\t\t}\n\t}\n\tif routeAllReserved && callOpts.Timeout == nil {\n\t\tif timeout, ok := timeoutExtra(extra, \"timeout\"); ok {\n\t\t\tcallOpts.Timeout = &timeout\n\t\t}\n\t}\n\tif routeAllReserved {\n\t\tif headers := headersExtra(extra, \"extra_headers\"); len(headers) > 0 {\n\t\t\tmerged := map[string]string{}; for k,v := range headers { merged[k]=v }; for k,v := range callOpts.ExtraHeaders { merged[k]=v }; callOpts.ExtraHeaders=merged\n\t\t}\n\t}\n\treturn callOpts\n}",
+    "test": "TestHeaderMergeCaseInsensitive"
+  },
+  {
+    "name": "stream-header-merge",
+    "file": "chat.go",
+    "before": "return mergeHeaders(map[string]string{\"accept\": \"text/event-stream\"}, headers)",
+    "after": "out := map[string]string{\"accept\":\"text/event-stream\"}; for k,v := range headers { out[k]=v }; return out",
+    "test": "TestStreamHeaderOverrideCaseInsensitive"
+  },
+  {
+    "name": "loopback-address-shape",
+    "file": "oauth_loopback.go",
+    "before": "tcp, ok := addr.(*net.TCPAddr)\n\tif !ok || tcp == nil {\n\t\treturn 0, errors.New(\"OAuth listener did not return a TCP address\")\n\t}",
+    "after": "tcp := addr.(*net.TCPAddr)",
+    "test": "TestOAuthLoopbackAddressShape"
+  },
+  {
+    "name": "tool-call-index-overflow",
+    "file": "chat_types.go",
+    "before": "parsed, err := value.Int64()\n\t\tif err != nil {\n\t\t\treturn 0\n\t\t}",
+    "after": "parsed, _ := value.Int64()",
+    "test": "TestToolCallIndexOverflow"
+  },
+  {
+    "name": "partial-telemetry-policy",
+    "file": "telemetry_reporter.go",
+    "before": "body, err := io.ReadAll(io.LimitReader(resp.Body, telemetryMaxBatchBytes))\n\tif err != nil {\n\t\treturn resp.StatusCode, resp.Header, nil, nil\n\t}",
+    "after": "body, _ := io.ReadAll(io.LimitReader(resp.Body, telemetryMaxBatchBytes))",
+    "test": "TestTelemetryPartialPolicyIsDiscarded"
+  },
+  {
+    "name": "exchange-typed-error",
+    "file": "oauth.go",
+    "before": "return &ResponseShapeError{Err: err}",
+    "after": "return err",
+    "test": "TestAuthWireFixtures"
+  },
+  {
+    "name": "userinfo-typed-error",
+    "file": "account.go",
+    "before": "return &ResponseShapeError{Err: err}",
+    "after": "return err",
+    "test": "TestAuthWireFixtures"
+  },
+  {
+    "name": "jwks-read-error",
+    "file": "attestation.go",
+    "before": "if err != nil {\n\t\treturn nil, attestationErr(\"cannot read JWKS response\", err)\n\t}",
+    "after": "",
+    "test": "TestJWKSReadError"
+  },
+  {
+    "name": "header-canonicalization",
+    "file": "extras.go",
+    "before": "headers.Set(key, layer[key])",
+    "after": "headers[key] = []string{layer[key]}",
+    "test": "TestHeaderMergeCaseInsensitive"
+  }
+]

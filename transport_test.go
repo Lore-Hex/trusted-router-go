@@ -251,3 +251,43 @@ func TestTruncateStringKeepsRunesWhole(t *testing.T) {
 		t.Fatalf("len = %d, want 6 (invalid bytes left as-is)", len(got))
 	}
 }
+
+func TestHeaderMergeCaseInsensitive(t *testing.T) {
+	extra := map[string]any{"extra_headers": map[string]string{"x-mode": "extra"}}
+	typed := CallOptions{ExtraHeaders: map[string]string{"X-Mode": "typed"}}
+	for name, opts := range map[string]CallOptions{
+		"chat":      chatCallOptions(ChatRequest{Extra: extra, CallOptions: typed}),
+		"responses": responsesCallOptions(ResponsesRequest{Extra: extra, CallOptions: typed}, true),
+	} {
+		if len(opts.ExtraHeaders) != 1 || opts.ExtraHeaders["X-Mode"] != "typed" {
+			t.Fatalf("%s headers = %v", name, opts.ExtraHeaders)
+		}
+	}
+}
+
+func TestStreamHeaderOverrideCaseInsensitive(t *testing.T) {
+	headers := eventStreamHeaders(map[string]string{"Accept": "custom"})
+	if len(headers) != 1 || headers["Accept"] != "custom" {
+		t.Fatalf("stream headers = %v", headers)
+	}
+	client, err := NewClient(Options{HTTPClient: newRoundTripClient(func(r *http.Request) (*http.Response, error) {
+		if r.Header.Get("Accept") != "custom" {
+			t.Fatalf("Accept = %q", r.Header.Get("Accept"))
+		}
+		return jsonResponse(200, map[string]any{}, nil), nil
+	})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	// Also exercise the actual stream request assembly.
+	{
+		resp, err := client.openEventStream(context.Background(), http.MethodPost, "/responses", nil, CallOptions{ExtraHeaders: map[string]string{"Accept": "custom"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := resp.Body.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}

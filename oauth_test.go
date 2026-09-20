@@ -1,10 +1,14 @@
 package trustedrouter
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -292,4 +296,117 @@ func mustParseURL(t *testing.T, raw string) *url.URL {
 		t.Fatal(err)
 	}
 	return parsed
+}
+
+// TestAuthWireFixtures exercises literal producer bytes through public HTTP paths.
+func TestAuthWireFixtures(t *testing.T) {
+	raw, err := os.ReadFile("testdata/auth-wire-fixtures.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	type wireCases struct {
+		Accept map[string]json.RawMessage `json:"accept"`
+		Reject map[string]json.RawMessage `json:"reject"`
+	}
+	var wire map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		t.Fatal(err)
+	}
+	for _, endpoint := range []string{"exchange", "userinfo"} {
+		var cases wireCases
+		if err := json.Unmarshal(wire[endpoint], &cases); err != nil {
+			t.Fatal(err)
+		}
+		for verdict, payloads := range map[string]map[string]json.RawMessage{"accept": cases.Accept, "reject": cases.Reject} {
+			for name, payload := range payloads {
+				t.Run(endpoint+"/"+verdict+"/"+name, func(t *testing.T) {
+					client, err := NewClient(Options{HTTPClient: newRoundTripClient(func(r *http.Request) (*http.Response, error) {
+						method, path := http.MethodPost, "/auth/keys"
+						if endpoint == "userinfo" {
+							method, path = http.MethodGet, "/auth/userinfo"
+						}
+						if r.Method != method || !strings.HasSuffix(r.URL.Path, path) {
+							t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+						}
+						return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(payload))}, nil
+					})})
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer client.Close()
+					var got any
+					if endpoint == "exchange" {
+						got, err = client.ExchangeOAuthKey(context.Background(), OAuthKeyExchangeRequest{Code: "code"})
+					} else {
+						got, err = client.UserInfo(context.Background())
+					}
+					if verdict == "reject" {
+						var shape *ResponseShapeError
+						if !errors.As(err, &shape) {
+							t.Fatalf("want typed shape error, got %T: %v", err, err)
+						}
+						return
+					}
+					if err != nil {
+						t.Fatal(err)
+					}
+					var want any
+					if err := json.Unmarshal(payload, &want); err != nil {
+						t.Fatal(err)
+					}
+					assertWireFields(t, want, authWireValue(reflect.ValueOf(got)))
+				})
+			}
+		}
+	}
+}
+
+// Reconstruct public typed fields plus Extra, so every producer field is checked,
+// including unknown nested identity data and null legacy subjects.
+func authWireValue(v reflect.Value) any {
+	if v.Kind() == reflect.Pointer {
+		if v.IsNil() {
+			return nil
+		}
+		return authWireValue(v.Elem())
+	}
+	if v.Kind() != reflect.Struct {
+		return v.Interface()
+	}
+	out := map[string]any{}
+	for i := 0; i < v.NumField(); i++ {
+		field := v.Type().Field(i)
+		if field.Name == "Extra" {
+			if extra, ok := v.Field(i).Interface().(map[string]any); ok {
+				for k, value := range extra {
+					out[k] = value
+				}
+			}
+			continue
+		}
+		key := strings.Split(field.Tag.Get("json"), ",")[0]
+		if key != "" && key != "-" {
+			out[key] = authWireValue(v.Field(i))
+		}
+	}
+	return out
+}
+
+func assertWireFields(t *testing.T, want, got any) {
+	t.Helper()
+	if fields, ok := want.(map[string]any); ok {
+		actual, ok := got.(map[string]any)
+		if !ok {
+			t.Fatalf("want object %v, got %T", want, got)
+		}
+		for key, value := range fields {
+			next, exists := actual[key]
+			if !exists {
+				t.Fatalf("missing field %s", key)
+			}
+			assertWireFields(t, value, next)
+		}
+	} else if !reflect.DeepEqual(want, got) {
+		t.Fatalf("wire field = %#v, want %#v", got, want)
+	}
 }

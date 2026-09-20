@@ -86,10 +86,13 @@ type OAuthKeyExchangeResponse struct {
 
 // UnmarshalJSON decodes an OAuth key exchange response and preserves unknown fields in Extra.
 func (o *OAuthKeyExchangeResponse) UnmarshalJSON(data []byte) error {
+	if err := requireJSONField(data, "key", '"'); err != nil {
+		return err
+	}
 	type alias OAuthKeyExchangeResponse
 	var out alias
 	if err := json.Unmarshal(data, &out); err != nil {
-		return err
+		return &ResponseShapeError{Err: err}
 	}
 	*o = OAuthKeyExchangeResponse(out)
 	o.Extra = extraFields(data, "key", "user_id", "identity", "data")

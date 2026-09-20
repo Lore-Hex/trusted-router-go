@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"testing"
@@ -231,4 +232,15 @@ func getLoopbackPage(t *testing.T, requestURL string) (string, int) {
 func localLoopbackListenUnavailable(err error) bool {
 	message := err.Error()
 	return strings.Contains(message, "operation not permitted") || strings.Contains(message, "address already in use")
+}
+
+func TestOAuthLoopbackAddressShape(t *testing.T) {
+	for _, addr := range []net.Addr{nil, (*net.TCPAddr)(nil), &net.UnixAddr{Name: "socket", Net: "unix"}} {
+		if _, err := oauthLoopbackPort(addr); err == nil {
+			t.Fatalf("accepted %T", addr)
+		}
+	}
+	if port, err := oauthLoopbackPort(&net.TCPAddr{Port: 1234}); err != nil || port != 1234 {
+		t.Fatalf("port = %d, %v", port, err)
+	}
 }

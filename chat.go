@@ -105,7 +105,7 @@ func (c *Client) chatCompletionsChunks(ctx context.Context, req ChatRequest, inc
 			yield(ChatCompletionChunk{}, err)
 			return
 		}
-		defer resp.Body.Close()
+		defer resp.Body.Close() //nolint:errcheck // Close is best-effort cleanup; preserve the completed operation result.
 
 		for event, err := range iterSSEChunks(resp.Body) {
 			if err != nil {
@@ -151,11 +151,7 @@ func (c *Client) openEventStream(ctx context.Context, method, path string, body 
 		return nil, err
 	}
 
-	headers := map[string]string{"accept": "text/event-stream"}
-	for key, value := range callOpts.ExtraHeaders {
-		headers[key] = value
-	}
-	callOpts.ExtraHeaders = headers
+	callOpts.ExtraHeaders = eventStreamHeaders(callOpts.ExtraHeaders)
 
 	resp, err := c.do(ctx, requestSpec{
 		method:          method,
@@ -272,4 +268,8 @@ func withUsage(params map[string]any) map[string]any {
 	}
 	merged["stream_options"] = streamOptions
 	return merged
+}
+
+func eventStreamHeaders(headers map[string]string) map[string]string {
+	return mergeHeaders(map[string]string{"accept": "text/event-stream"}, headers)
 }
