@@ -6,6 +6,7 @@ package trustedrouter
 // retry/failover loop lives in transport.go.
 
 import (
+	"fmt"
 	"net/http"
 	"os"
 	"strings"
@@ -17,6 +18,10 @@ const defaultMaxRetries = 2
 
 // Options configures a TrustedRouter Client.
 type Options struct {
+	// GatewayPolicy requires a fresh, image-pinned GCP attestation on the
+	// inference connection before any API key or body is sent. Other evidence
+	// formats are refused. Control-plane requests use the ordinary client.
+	GatewayPolicy *AttestationPolicy
 	// APIKey is the bearer token used for requests.
 	APIKey string
 	// BaseURL is a custom OpenAI-compatible inference API base URL.
@@ -92,6 +97,7 @@ type CallOptions struct {
 
 // Client is a TrustedRouter API client.
 type Client struct {
+	verifiedHTTPClient       *http.Client
 	apiKey                   string
 	baseURL                  string
 	controlBaseURL           string
@@ -142,6 +148,17 @@ func NewClient(opts Options) (*Client, error) {
 
 	httpClient := cloneHTTPClientWithRedirectProtection(opts.HTTPClient)
 	credentialFreeHTTPClient := cloneCredentialFreeHTTPClient(httpClient)
+	var verified *http.Client
+	if opts.GatewayPolicy != nil {
+		policy := *opts.GatewayPolicy
+		if policy.AllowDebug || !validImagePins(policy) {
+			return nil, fmt.Errorf("verified inference requires non-debug sha256 image digest pins")
+		}
+		policy.ExpectedImageDigests = append([]string(nil), policy.ExpectedImageDigests...)
+		policy.ExpectedImageReferences = append([]string(nil), policy.ExpectedImageReferences...)
+		verified = cloneHTTPClientWithRedirectProtection(nil)
+		verified.Transport = newVerifiedTransport(policy)
+	}
 	defaultTimeout := defaultTimeoutFromOptions(opts.Timeout)
 
 	headers := map[string]string{}
@@ -155,6 +172,7 @@ func NewClient(opts Options) (*Client, error) {
 	}
 
 	return &Client{
+		verifiedHTTPClient:       verified,
 		apiKey:                   opts.APIKey,
 		baseURL:                  baseURL,
 		controlBaseURL:           controlBaseURL,

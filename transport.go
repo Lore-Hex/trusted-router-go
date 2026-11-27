@@ -109,6 +109,9 @@ type requestSpec struct {
 // successful open the SAME cancel-cause is handed to the idle-timeout body
 // wrapper, so a leaked timer or goroutine trips the -race stream tests.
 func (c *Client) do(ctx context.Context, spec requestSpec) (*http.Response, error) {
+	if !spec.controlPlane && c.verifiedHTTPClient == nil && privateInferenceRequested(spec) {
+		return nil, attestationErr("private inference requires an image-pinned GatewayPolicy", nil)
+	}
 	if spec.autoIdempotency {
 		if spec.opts == nil {
 			spec.opts = &CallOptions{}
@@ -182,6 +185,15 @@ func (c *Client) do(ctx context.Context, spec requestSpec) (*http.Response, erro
 		httpClient := c.httpClient
 		if spec.credentialFree {
 			httpClient = c.credentialFreeHTTPClient
+		}
+		if !spec.controlPlane && c.verifiedHTTPClient != nil {
+			if req.URL.Scheme != "https" {
+				stopTimer(openTimer)
+				cancelAttempt()
+				recorder.finish()
+				return nil, attestationErr("verified inference requires HTTPS", nil)
+			}
+			httpClient = c.verifiedHTTPClient
 		}
 		resp, err := httpClient.Do(req)
 		// The open timer covers exactly the wait for response headers.

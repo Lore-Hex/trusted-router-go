@@ -93,4 +93,6 @@ testdata/module-files.txt
 testdata/release-files.txt
 transport.go
 transport_test.go
+verified_transport.go
+verified_transport_test.go
 version.go

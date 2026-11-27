@@ -219,6 +219,16 @@ token, err := client.ExchangeOAuthKey(ctx, trustedrouter.OAuthKeyExchangeRequest
 
 ## Attestation Verification
 
+For private inference, configure the client with a non-debug GCP image digest
+that you independently trust. For example, pass
+`GatewayPolicy: &trustedrouter.AttestationPolicy{ExpectedImageDigest: digest}`
+to `NewClient`, where `digest` is the full `sha256:` digest. The ordinary chat
+and streaming methods then verify each new TLS connection **before** sending
+the bearer token or request. Retries verify again. This verifier accepts GCP
+evidence only; other evidence formats fail closed. An upstream privacy filter
+does not replace this gateway check, or vice versa. Inspecting a separate
+attestation, as below, does not verify a subsequent HTTP connection.
+
 ```go
 doc, err := client.Attestation(ctx)
 if err != nil {
