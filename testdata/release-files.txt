@@ -30,4 +30,5 @@ sse.go
 telemetry.go
 telemetry_reporter.go
 transport.go
+verified_transport.go
 version.go
