@@ -41,7 +41,9 @@ func verifiedTransport(policy AttestationPolicy, verify func(context.Context, Ve
 			return nil, err
 		}
 		if s.reader.Buffered() != 0 {
-			_ = s.Conn.Close()
+			if err := s.Conn.Close(); err != nil {
+				return nil, fmt.Errorf("close connection after unexpected attestation bytes: %w", err)
+			}
 			return nil, fmt.Errorf("unexpected bytes after gateway attestation")
 		}
 		return s.Conn, nil
