@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.0
+
+- Private inference now requires a non-debug image-pinned gateway policy. On GCP,
+  the chat request uses the TLS connection whose exporter was attested; failed
+  verification sends neither credentials nor prompts. Other planes fail closed.
+
 ## 0.5.0 — 2026-09-20
 
 - Offline signed inference receipt verification: `VerifyReceipt` accepts a
