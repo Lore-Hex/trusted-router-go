@@ -151,7 +151,13 @@ func NewClient(opts Options) (*Client, error) {
 	var verified *http.Client
 	if opts.GatewayPolicy != nil {
 		policy := *opts.GatewayPolicy
-		if policy.AllowDebug || !validImagePins(policy) {
+		if policy.AzureSNP != nil {
+			pins := *policy.AzureSNP
+			policy.AzureSNP = &pins
+			if err := policy.checkAzureSNPPolicy(); err != nil {
+				return nil, err
+			}
+		} else if policy.AllowDebug || !validImagePins(policy) {
 			return nil, fmt.Errorf("verified inference requires non-debug sha256 image digest pins")
 		}
 		policy.ExpectedImageDigests = append([]string(nil), policy.ExpectedImageDigests...)

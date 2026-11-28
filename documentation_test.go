@@ -64,6 +64,7 @@ func TestDocumentationExamples(t *testing.T) {
 					code = fragmentProgram(t, code)
 				}
 				dxWrite(t, filepath.Join(dir, "main.go"), []byte(code))
+				dxCommand(t, dir, "go", "mod", "tidy")
 				dxCommand(t, dir, "go", "build", ".")
 			})
 			if lang == "go" {

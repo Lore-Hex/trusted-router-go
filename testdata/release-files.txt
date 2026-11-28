@@ -2,6 +2,7 @@ LICENSE
 README.md
 account.go
 attestation.go
+azure_snp.go
 billing.go
 boundary.go
 broadcast.go
@@ -15,6 +16,7 @@ embeddings.go
 errors.go
 extras.go
 go.mod
+go.sum
 messages.go
 models.go
 oauth.go
