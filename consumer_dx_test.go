@@ -58,7 +58,7 @@ func TestReleaseArtifact(t *testing.T) {
 	if err := json.Unmarshal(dxCommand(t, ".", "go", "list", "-m", "-json"), &mod); err != nil {
 		t.Fatal(err)
 	}
-	if mod.Path != modulePath || mod.GoVersion != "1.23" {
+	if mod.Path != modulePath || mod.GoVersion != "1.23.0" {
 		t.Fatalf("module metadata: %+v", mod)
 	}
 	readme := string(dxRead(t, "README.md"))
@@ -80,7 +80,7 @@ func TestReleaseArtifact(t *testing.T) {
 			files = append(files, name)
 		}
 	}
-	files = append(files, "LICENSE", "README.md", "go.mod")
+	files = append(files, "LICENSE", "README.md", "go.mod", "go.sum")
 	err = filepath.WalkDir("cmd", func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -252,6 +252,7 @@ func TestScratchConsumer(t *testing.T) {
 	dir := consumerModule(t, artifact)
 	// This is exactly the same public example that go test executes locally.
 	dxWrite(t, filepath.Join(dir, "example_test.go"), dxRead(t, "example_test.go"))
+	dxCommand(t, dir, "go", "mod", "tidy")
 	out := dxCommand(t, dir, "go", "test", "-v", ".")
 	if !bytes.Contains(out, []byte("PASS: ExampleClient_ChatCompletions")) {
 		t.Fatalf("example did not run: %s", out)

@@ -64,6 +64,8 @@ func (e *AttestationVerificationError) Unwrap() error {
 
 // AttestationPolicy pins the attested workload values that must match.
 type AttestationPolicy struct {
+	// AzureSNP requires a direct AMD-signed report; a vendor JWT is not accepted.
+	AzureSNP *AzureSNPPolicy `json:"azure_snp,omitempty"`
 	// GCPAudience is the required JWT audience. Empty defaults to "quill-cloud".
 	GCPAudience string `json:"gcp_audience"`
 	// ExpectedCertSHA256 pins the TLS leaf certificate SHA-256 committed by the JWT.
@@ -368,6 +370,9 @@ func FetchTrustRelease(ctx context.Context, trustURL string) (*TrustRelease, err
 
 // VerifyGatewayAttestation verifies a GCP Confidential Space attestation JWT.
 func VerifyGatewayAttestation(ctx context.Context, document []byte, opts VerifyGatewayAttestationOptions) (*GatewayAttestation, error) {
+	if opts.Policy.AzureSNP != nil {
+		return verifyAzureSNP(ctx, document, opts)
+	}
 	payload, err := verifiedAttestationJWTClaims(ctx, document, opts.JWKS, opts.JWKSURL, opts.HTTPClient)
 	if err != nil {
 		return nil, err
@@ -382,6 +387,9 @@ func VerifyGatewayAttestation(ctx context.Context, document []byte, opts VerifyG
 // exporter, or caller-nonce checks. The key commitment must be a member of the
 // token's eat_nonce set.
 func VerifyReceiptKeyAttestation(ctx context.Context, document []byte, opts VerifyReceiptKeyAttestationOptions) error {
+	if opts.Policy.AzureSNP != nil {
+		return attestationErr("raw AMD session evidence is not receipt-key evidence", nil)
+	}
 	payload, err := verifiedAttestationJWTClaims(ctx, document, opts.JWKS, opts.JWKSURL, opts.HTTPClient)
 	if err != nil {
 		return err

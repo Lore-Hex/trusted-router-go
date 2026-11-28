@@ -9,7 +9,7 @@ The package also exposes the same stable routing/privacy aliases and five
 atomic orchestration builders as the other official SDKs: Synth, Advisor,
 Selector, MapReduce, and Subagent.
 
-Requires Go 1.23 or later. No runtime dependencies.
+Requires Go 1.23 or later. Raw AMD hardware verification uses Google's go-sev-guest library.
 
 - Repository: https://github.com/Lore-Hex/trusted-router-go
 - Homepage: https://trustedrouter.com
@@ -224,10 +224,22 @@ that you independently trust. For example, pass
 `GatewayPolicy: &trustedrouter.AttestationPolicy{ExpectedImageDigest: digest}`
 to `NewClient`, where `digest` is the full `sha256:` digest. The ordinary chat
 and streaming methods then verify each new TLS connection **before** sending
-the bearer token or request. Retries verify again. This verifier accepts GCP
-evidence only; other evidence formats fail closed. An upstream privacy filter
+the bearer token or request. Retries verify again. A GCP policy accepts only
+GCP evidence. An upstream privacy filter
 does not replace this gateway check, or vice versa. Inspecting a separate
 attestation, as below, does not verify a subsequent HTTP connection.
+
+For Azure, choose `GatewayPolicy: &trustedrouter.AttestationPolicy{AzureSNP: &pins}`,
+where `pins` is an `AzureSNPPolicy` with the independently approved AMD product
+line, UVM launch measurement, regional CCE policy hash (`HOST_DATA`), and
+reported and launch TCB floors. Do not take those values from the server you
+are checking. This mode requires the gateway's `amd-snp-v1` response and
+checks an AMD VCEK-signed report, its endorsement and current revocation list,
+the caller's random nonce, leaf certificate and TLS exporter before sending the
+request. The SDK fetches endorsement material from AMD's KDS without gateway
+credentials. A Microsoft token, VLEK without its endorsement, unavailable
+KDS, and old gateways without raw evidence are refused; there is no JWT
+fallback. This attests the gateway workload, not an upstream GPU.
 
 ```go
 doc, err := client.Attestation(ctx)

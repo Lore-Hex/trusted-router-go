@@ -57,6 +57,7 @@ type GatewaySession struct {
 	hostHeader      string
 	attestationPath string
 	timeout         time.Duration
+	rawSNP          bool
 }
 
 // verifyGatewaySessionTLSConfigHook lets package tests add a local root without
@@ -119,6 +120,12 @@ func VerifyGatewaySession(ctx context.Context, opts VerifyGatewaySessionOptions)
 	exporter = append([]byte(nil), exporter...)
 
 	reader := bufio.NewReader(conn)
+	if opts.Policy.AzureSNP != nil {
+		if err := opts.Policy.checkAzureSNPPolicy(); err != nil {
+			return nil, err
+		}
+		target.attestationPath += "?format=amd-snp-v1"
+	}
 	freshNonce, err := randomNonceHex(ExporterLength)
 	if err != nil {
 		return nil, err
@@ -150,6 +157,7 @@ func VerifyGatewaySession(ctx context.Context, opts VerifyGatewaySessionOptions)
 		hostHeader:      target.hostHeader,
 		attestationPath: target.attestationPath,
 		timeout:         timeout,
+		rawSNP:          opts.Policy.AzureSNP != nil,
 	}, nil
 }
 
@@ -169,6 +177,9 @@ func (s *GatewaySession) Reader() *bufio.Reader {
 func (s *GatewaySession) FetchAttestationAgain(ctx context.Context) ([]byte, error) {
 	if s == nil || s.Conn == nil || s.reader == nil {
 		return nil, fmt.Errorf("nil gateway session")
+	}
+	if s.rawSNP {
+		return nil, fmt.Errorf("raw AMD evidence requires a fresh challenge: call VerifyGatewaySession")
 	}
 	timeout := s.timeout
 	if timeout == 0 {
@@ -251,7 +262,11 @@ func fetchAttestationOnConn(ctx context.Context, conn *tls.Conn, reader *bufio.R
 
 	target := attestationPath
 	if nonceHex != "" {
-		target += "?nonce=" + url.QueryEscape(nonceHex)
+		delimiter := "?"
+		if strings.Contains(target, "?") {
+			delimiter = "&"
+		}
+		target += delimiter + "nonce=" + url.QueryEscape(nonceHex)
 	}
 	request := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nConnection: keep-alive\r\n\r\n", target, hostHeader, userAgent())
 	n, err := io.WriteString(conn, request)
@@ -371,6 +386,9 @@ func gatewaySessionContentLength(header http.Header) (int64, error) {
 	}
 	if contentLength > int64(int(^uint(0)>>1)) {
 		return 0, fmt.Errorf("attestation response too large")
+	}
+	if contentLength > 1<<20 {
+		return 0, fmt.Errorf("attestation response exceeds 1 MiB")
 	}
 	return contentLength, nil
 }
