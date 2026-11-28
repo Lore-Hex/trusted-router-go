@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.0
+
+- Add opt-in Azure SEV-SNP verification on the TLS connection used for
+  inference. Callers supply the reviewed regional policy, launch measurement
+  and firmware floors. A missing or invalid raw report fails closed before
+  credentials or prompts are sent; this does not attest the provider's GPU.
+
 ## 0.6.0
 
 - Private inference now requires a non-debug image-pinned gateway policy. On GCP,
